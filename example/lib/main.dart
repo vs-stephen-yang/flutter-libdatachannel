@@ -1,62 +1,87 @@
 import 'package:flutter/material.dart';
-import 'dart:async';
 
-import 'package:flutter/services.dart';
-import 'package:flutter_libdatachannel/flutter_libdatachannel.dart';
+import 'modes/receive_dump_page.dart';
+import 'modes/playback_page.dart';
 
 void main() {
   runApp(const MyApp());
 }
 
-class MyApp extends StatefulWidget {
+class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
-  @override
-  State<MyApp> createState() => _MyAppState();
-}
-
-class _MyAppState extends State<MyApp> {
-  String _platformVersion = 'Unknown';
-  final _flutterLibdatachannelPlugin = FlutterLibdatachannel();
-
-  @override
-  void initState() {
-    super.initState();
-    initPlatformState();
-  }
-
-  // Platform messages are asynchronous, so we initialize in an async method.
-  Future<void> initPlatformState() async {
-    String platformVersion;
-    // Platform messages may fail, so we use a try/catch PlatformException.
-    // We also handle the message potentially returning null.
-    try {
-      platformVersion =
-          await _flutterLibdatachannelPlugin.getPlatformVersion() ?? 'Unknown platform version';
-    } on PlatformException {
-      platformVersion = 'Failed to get platform version.';
-    }
-
-    // If the widget was removed from the tree while the asynchronous platform
-    // message was in flight, we want to discard the reply rather than calling
-    // setState to update our non-existent appearance.
-    if (!mounted) return;
-
-    setState(() {
-      _platformVersion = platformVersion;
-    });
-  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      home: Scaffold(
-        appBar: AppBar(
-          title: const Text('Plugin example app'),
+      title: 'flutter_libdatachannel Example',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        useMaterial3: true,
+      ),
+      home: const MainShell(),
+    );
+  }
+}
+
+class MainShell extends StatefulWidget {
+  const MainShell({super.key});
+
+  @override
+  State<MainShell> createState() => _MainShellState();
+}
+
+class _MainShellState extends State<MainShell>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+  final _receiveDumpKey = GlobalKey<ReceiveDumpPageState>();
+  final _playbackKey = GlobalKey<PlaybackPageState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _tabController.addListener(_onTabChanged);
+  }
+
+  @override
+  void dispose() {
+    _tabController.removeListener(_onTabChanged);
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  void _onTabChanged() {
+    if (!_tabController.indexIsChanging) return;
+    // Reset the tab we're leaving
+    switch (_tabController.previousIndex) {
+      case 0:
+        _receiveDumpKey.currentState?.reset();
+        break;
+      case 1:
+        _playbackKey.currentState?.reset();
+        break;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('flutter_libdatachannel'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.fiber_manual_record), text: 'Receive & Dump'),
+            Tab(icon: Icon(Icons.play_circle), text: 'Playback'),
+          ],
         ),
-        body: Center(
-          child: Text('Running on: $_platformVersion\n'),
-        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          ReceiveDumpPage(key: _receiveDumpKey),
+          PlaybackPage(key: _playbackKey),
+        ],
       ),
     );
   }
