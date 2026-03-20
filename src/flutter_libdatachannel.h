@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 // Lifecycle
-LDC_EXPORT int ldc_create_peer_connection(const char* ice_servers_json);
+LDC_EXPORT int ldc_create_peer_connection(const char* ice_servers_json, int disable_auto_negotiation);
 LDC_EXPORT void ldc_close_peer_connection(int pc_id);
 LDC_EXPORT void ldc_delete_peer_connection(int pc_id);
 

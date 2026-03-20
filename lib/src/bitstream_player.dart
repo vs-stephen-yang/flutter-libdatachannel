@@ -15,68 +15,94 @@ class BitstreamPlayer {
   bool get isPlaying => _playing;
   bool get isPaused => _paused;
 
-  Future<void> play(RTCTrack track, String filePath, {double speed = 1.0}) async {
+  Future<void> play(RTCTrack track, String filePath,
+      {double speed = 1.0}) async {
     if (_playing) throw StateError('Already playing');
     _playing = true;
     _paused = false;
     _playCompleter = Completer<void>();
 
     try {
-      final file = await File(filePath).open(mode: FileMode.read);
-      try {
-        // Read header
-        final headerBytes = Uint8List(kDumpHeaderSize);
-        await file.readInto(headerBytes);
-        DumpHeader.fromBytes(headerBytes); // validate
+      // Load entire file into memory for fast access.
+      final bytes = await File(filePath).readAsBytes();
+      final data = ByteData.sublistView(bytes);
+      DumpHeader.fromBytes(Uint8List.sublistView(bytes, 0, kDumpHeaderSize));
 
-        final fileLength = await file.length();
-        int offset = kDumpHeaderSize;
-        _wallClockStartUs = null;
+      // Parse all records and detect primary PT in one pass.
+      final records = <_DumpRecord>[];
+      final ptCounts = <int, int>{};
+      int offset = kDumpHeaderSize;
+      while (offset + kDumpRecordHeaderSize <= bytes.length) {
+        final timestampUs = data.getUint64(offset, Endian.little);
+        final payloadLength = data.getUint32(offset + 8, Endian.little);
+        offset += kDumpRecordHeaderSize;
+        if (offset + payloadLength > bytes.length) break;
+        final rtpPacket = Uint8List.sublistView(bytes, offset, offset + payloadLength);
+        offset += payloadLength;
+        if (rtpPacket.length < 12) continue;
+        final pt = rtpPacket[1] & 0x7F;
+        ptCounts[pt] = (ptCounts[pt] ?? 0) + 1;
+        records.add(_DumpRecord(timestampUs, pt, rtpPacket));
+      }
 
-        while (_playing && offset < fileLength) {
-          // Check for pause
-          if (_paused) {
-            _pauseCompleter = Completer<void>();
-            await _pauseCompleter!.future;
-            // Reset wall clock after resume so pause duration is not counted
-            _wallClockStartUs = null;
-            if (!_playing) break;
-          }
+      // Find primary PT (most common).
+      int? primaryPt;
+      if (ptCounts.isNotEmpty) {
+        primaryPt = ptCounts.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+      }
 
-          // Read record header
-          final recordHeaderBytes = Uint8List(kDumpRecordHeaderSize);
-          await file.setPosition(offset);
-          final bytesRead = await file.readInto(recordHeaderBytes);
-          if (bytesRead < kDumpRecordHeaderSize) break;
+      // Depacketize and group into access units by RTP timestamp.
+      final depack = _H264RtpDepacketizer();
+      final frames = <_Frame>[];
+      int? prevRtpTs;
+      var naluBatch = BytesBuilder();
+      int? batchTimestampUs;
 
-          final data = ByteData.sublistView(recordHeaderBytes);
-          final timestampUs = data.getUint64(0, Endian.little);
-          final payloadLength = data.getUint32(8, Endian.little);
+      for (final rec in records) {
+        if (primaryPt != null && rec.pt != primaryPt) continue;
 
-          // Read payload
-          final payload = Uint8List(payloadLength);
-          await file.readInto(payload);
+        final rtpTs = (rec.rtpPacket[4] << 24) | (rec.rtpPacket[5] << 16) |
+            (rec.rtpPacket[6] << 8) | rec.rtpPacket[7];
 
-          // Wait using absolute wall-clock targeting to avoid drift
-          if (speed > 0) {
-            final nowUs = DateTime.now().microsecondsSinceEpoch;
-            _wallClockStartUs ??= nowUs;
-            final targetUs = (timestampUs / speed).round();
-            final delayUs = targetUs - (nowUs - _wallClockStartUs!);
-            if (delayUs > 0) {
-              await Future.delayed(Duration(microseconds: delayUs));
-            }
-          }
-
-          if (!_playing) break;
-
-          // Send the packet
-          await track.send(payload);
-
-          offset += kDumpRecordHeaderSize + payloadLength;
+        if (prevRtpTs != null && rtpTs != prevRtpTs && naluBatch.length > 0) {
+          frames.add(_Frame(batchTimestampUs ?? 0, naluBatch.toBytes()));
+          naluBatch = BytesBuilder();
+          batchTimestampUs = rec.timestampUs;
         }
-      } finally {
-        await file.close();
+        prevRtpTs = rtpTs;
+        batchTimestampUs ??= rec.timestampUs;
+
+        for (final nalu in depack.process(rec.rtpPacket)) {
+          naluBatch.add(nalu);
+        }
+      }
+      if (naluBatch.length > 0) {
+        frames.add(_Frame(batchTimestampUs ?? 0, naluBatch.toBytes()));
+      }
+
+      // Play frames with timing.
+      _wallClockStartUs = null;
+      for (final frame in frames) {
+        if (!_playing) break;
+
+        if (_paused) {
+          _pauseCompleter = Completer<void>();
+          await _pauseCompleter!.future;
+          _wallClockStartUs = null;
+          if (!_playing) break;
+        }
+
+        if (speed > 0) {
+          final nowUs = DateTime.now().microsecondsSinceEpoch;
+          _wallClockStartUs ??= nowUs;
+          final targetUs = (frame.timestampUs / speed).round();
+          final delayUs = targetUs - (nowUs - _wallClockStartUs!);
+          if (delayUs > 0) {
+            await Future.delayed(Duration(microseconds: delayUs));
+          }
+        }
+        if (!_playing) break;
+        await track.send(frame.data);
       }
     } finally {
       _playing = false;
@@ -88,9 +114,7 @@ class BitstreamPlayer {
   }
 
   void pause() {
-    if (_playing && !_paused) {
-      _paused = true;
-    }
+    if (_playing && !_paused) _paused = true;
   }
 
   void resume() {
@@ -109,5 +133,103 @@ class BitstreamPlayer {
     _pauseCompleter?.complete();
     _pauseCompleter = null;
     await _playCompleter?.future;
+  }
+}
+
+class _DumpRecord {
+  _DumpRecord(this.timestampUs, this.pt, this.rtpPacket);
+  final int timestampUs;
+  final int pt;
+  final Uint8List rtpPacket;
+}
+
+class _Frame {
+  _Frame(this.timestampUs, this.data);
+  final int timestampUs;
+  final Uint8List data;
+}
+
+/// Depacketizes H.264 RTP packets into NAL units with Annex B start codes.
+class _H264RtpDepacketizer {
+  BytesBuilder _fuBuffer = BytesBuilder();
+
+  static int _rtpPayloadOffset(Uint8List pkt) {
+    if (pkt.length < 12) return pkt.length;
+    int offset = 12 + (pkt[0] & 0x0F) * 4;
+    if ((pkt[0] & 0x10) != 0 && offset + 4 <= pkt.length) {
+      final extLen = (pkt[offset + 2] << 8) | pkt[offset + 3];
+      offset += 4 + extLen * 4;
+    }
+    return offset;
+  }
+
+  List<Uint8List> process(Uint8List rtpPacket) {
+    final payloadOffset = _rtpPayloadOffset(rtpPacket);
+    if (payloadOffset >= rtpPacket.length) return [];
+    final payload = Uint8List.sublistView(rtpPacket, payloadOffset);
+
+    Uint8List effective = payload;
+    if ((rtpPacket[0] & 0x20) != 0 && payload.isNotEmpty) {
+      final padLen = rtpPacket[rtpPacket.length - 1];
+      final end = payload.length - padLen;
+      if (end <= 0) return [];
+      effective = Uint8List.sublistView(payload, 0, end);
+    }
+
+    if (effective.isEmpty) return [];
+    final nalType = effective[0] & 0x1F;
+
+    if (nalType >= 1 && nalType <= 23) {
+      return [_withStartCode(effective)];
+    } else if (nalType == 24) {
+      return _parseStapA(effective);
+    } else if (nalType == 28) {
+      return _parseFuA(effective);
+    }
+    return [];
+  }
+
+  static Uint8List _withStartCode(Uint8List nalu) {
+    final result = Uint8List(4 + nalu.length);
+    result[3] = 1;
+    result.setRange(4, result.length, nalu);
+    return result;
+  }
+
+  static List<Uint8List> _parseStapA(Uint8List payload) {
+    final nalus = <Uint8List>[];
+    int off = 1;
+    while (off + 2 <= payload.length) {
+      final len = (payload[off] << 8) | payload[off + 1];
+      off += 2;
+      if (off + len > payload.length) break;
+      nalus.add(_withStartCode(Uint8List.sublistView(payload, off, off + len)));
+      off += len;
+    }
+    return nalus;
+  }
+
+  List<Uint8List> _parseFuA(Uint8List payload) {
+    if (payload.length < 2) return [];
+    final fuIndicator = payload[0];
+    final fuHeader = payload[1];
+    final start = (fuHeader & 0x80) != 0;
+    final end = (fuHeader & 0x40) != 0;
+    final nalType = fuHeader & 0x1F;
+    final nri = fuIndicator & 0x60;
+
+    if (start) {
+      _fuBuffer = BytesBuilder();
+      _fuBuffer.addByte(nri | nalType);
+    }
+    if (payload.length > 2) {
+      _fuBuffer.add(Uint8List.sublistView(payload, 2));
+    }
+    if (end) {
+      final nalu = _fuBuffer.toBytes();
+      _fuBuffer = BytesBuilder();
+      return [_withStartCode(Uint8List.fromList(nalu))];
+    }
+    return [];
   }
 }

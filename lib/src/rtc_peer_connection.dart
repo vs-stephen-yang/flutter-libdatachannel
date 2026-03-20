@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'enums.dart';
 import 'method_channel.dart';
@@ -30,7 +29,8 @@ class RTCPeerConnection {
   static Future<RTCPeerConnection> create(RTCConfiguration config) async {
     final channel = LdcMethodChannel.instance;
     final pcId = await channel.invoke<int>('createPeerConnection', {
-      'iceServers': json.encode(config.iceServers),
+      'iceServers': config.iceServers,
+      'disableAutoNegotiation': config.disableAutoNegotiation ? 1 : 0,
     });
     if (pcId == null) throw Exception('Failed to create peer connection');
     final pc = RTCPeerConnection._(pcId);

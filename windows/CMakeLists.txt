@@ -28,7 +28,6 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libdatachannel"
 list(APPEND PLUGIN_SOURCES
   "flutter_libdatachannel_plugin.cpp"
   "flutter_libdatachannel_plugin.h"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../src/flutter_libdatachannel.cpp"
 )
 
 # Define the plugin library target. Its name must not be changed (see comment
@@ -57,7 +56,6 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE RTC_STATIC)
 target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(${PLUGIN_NAME} PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../src"
   "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libdatachannel/include")
 
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin)

@@ -112,13 +112,18 @@ class PlaybackPageState extends State<PlaybackPage> {
         onLog: _log,
       );
       _ldcSendTrack = result.ldcSendTrack;
-      _log('Signaling complete');
+      _log('Signaling complete, send track id=${_ldcSendTrack!.id}');
+
+      // Monitor send track events
+      _ldcSendTrack!.onOpen.listen((_) => _log('[ldc] send track OPEN'));
+      _ldcSendTrack!.onClosed.listen((_) => _log('[ldc] send track CLOSED'));
+      _ldcSendTrack!.onError.listen((e) => _log('[ldc] send track ERROR: $e'));
 
       // Display received video
       _remoteRenderer.srcObject = result.stream;
       _log('Remote stream attached to renderer');
 
-      // Wait a moment for the connection to stabilize
+      // Wait for connection + track to stabilize
       await Future.delayed(const Duration(milliseconds: 500));
 
       // Start playback

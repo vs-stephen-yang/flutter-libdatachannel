@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import 'package:flutter/services.dart';
 
 class LdcMethodChannel {
@@ -15,9 +13,6 @@ class LdcMethodChannel {
     _eventStream ??= _eventChannel.receiveBroadcastStream().map((event) {
       if (event is Map) {
         return Map<String, dynamic>.from(event);
-      }
-      if (event is String) {
-        return Map<String, dynamic>.from(json.decode(event) as Map);
       }
       return <String, dynamic>{};
     });

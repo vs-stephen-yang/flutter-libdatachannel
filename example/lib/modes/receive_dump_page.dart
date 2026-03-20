@@ -115,7 +115,7 @@ class ReceiveDumpPageState extends State<ReceiveDumpPage> {
       _fwrtcPc = await fwrtc.createPeerConnection(kLocalFwrtcConfig);
       _log('fwrtc PeerConnection created');
 
-      _ldcPc = await ldc.RTCPeerConnection.create(kLocalLdcConfig);
+      _ldcPc = await ldc.RTCPeerConnection.create(kLocalLdcRecvConfig);
       _log('ldc PeerConnection created (id: ${_ldcPc!.id})');
 
       // Monitor connection states

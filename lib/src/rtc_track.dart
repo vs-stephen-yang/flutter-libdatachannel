@@ -90,6 +90,7 @@ class RTCTrack {
   final _onClosed = StreamController<void>.broadcast();
   final _onError = StreamController<String>.broadcast();
   bool _listening = false;
+  bool _disposed = false;
 
   static RTCTrack create(int trId, String mid) {
     final track = RTCTrack._(trId, mid);
@@ -158,6 +159,8 @@ class RTCTrack {
   }
 
   Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
     await _eventSub?.cancel();
     await _onMessage.close();
     await _onOpen.close();

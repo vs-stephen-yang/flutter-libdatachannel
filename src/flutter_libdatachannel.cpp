@@ -1,6 +1,7 @@
 #include "flutter_libdatachannel.h"
 #include <rtc/rtc.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -217,8 +218,12 @@ void on_signaling_state_change(int pc, rtcSignalingState state, void* ptr) {
 }
 
 void setup_track_callbacks(int tr) {
+    fprintf(stderr, "[LDC-NATIVE] setup_track_callbacks(tr=%d)\n", tr);
+    fflush(stderr);
     rtcSetOpenCallback(tr, [](int id, void* p) {
         (void)p;
+        fprintf(stderr, "[LDC-NATIVE] onTrackOpen tr=%d\n", id);
+        fflush(stderr);
         std::ostringstream json;
         json << "{\"event\":\"onTrackOpen\",\"trId\":" << id << "}";
         fire_event(json.str());
@@ -239,15 +244,29 @@ void setup_track_callbacks(int tr) {
     });
     rtcSetMessageCallback(tr, [](int id, const char* message, int size, void* p) {
         (void)p;
-        if (size > 0) {
+        fprintf(stderr, "[LDC-NATIVE] onTrackMessage tr=%d size=%d\n", id, size);
+        fflush(stderr);
+        if (size >= 0) {
             fire_binary_event(id, reinterpret_cast<const uint8_t*>(message), size);
+        } else {
+            int actual = -size;
+            fire_binary_event(id, reinterpret_cast<const uint8_t*>(message), actual);
         }
+        // Diagnostic: fire a JSON event so we can see in the log
+        std::ostringstream json;
+        json << "{\"event\":\"onTrackMessageDebug\",\"trId\":" << id
+             << ",\"size\":" << size << "}";
+        fire_event(json.str());
     });
 }
 
 void on_track(int pc, int tr, void* ptr) {
     (void)ptr;
+    fprintf(stderr, "[LDC-NATIVE] on_track(pc=%d, tr=%d)\n", pc, tr);
+    fflush(stderr);
     std::string mid = get_string_from_rtc(rtcGetTrackMid, tr);
+    fprintf(stderr, "[LDC-NATIVE] on_track mid='%s'\n", mid.c_str());
+    fflush(stderr);
 
     setup_track_callbacks(tr);
 
@@ -263,7 +282,7 @@ void on_track(int pc, int tr, void* ptr) {
 // Public API implementation
 
 void ldc_init(void) {
-    rtcInitLogger(RTC_LOG_WARNING, nullptr);
+    rtcInitLogger(RTC_LOG_DEBUG, nullptr);
     rtcPreload();
 }
 
@@ -288,7 +307,9 @@ void ldc_set_binary_event_callback(ldc_binary_event_callback cb, void* user_data
     if (user_data) g_state.user_data = user_data;
 }
 
-int ldc_create_peer_connection(const char* ice_servers_json) {
+int ldc_create_peer_connection(const char* ice_servers_json, int disable_auto_negotiation) {
+    fprintf(stderr, "[LDC-NATIVE] ldc_create_peer_connection(disableAutoNeg=%d)\n", disable_auto_negotiation);
+    fflush(stderr);
     rtcConfiguration config = {};
 
     // Parse ice servers from JSON array
@@ -299,7 +320,7 @@ int ldc_create_peer_connection(const char* ice_servers_json) {
     }
     config.iceServers = servers;
     config.iceServersCount = server_count;
-    config.disableAutoNegotiation = true;
+    config.disableAutoNegotiation = disable_auto_negotiation ? true : false;
     config.forceMediaTransport = true;
 
     int pc = rtcCreatePeerConnection(&config);
@@ -336,7 +357,13 @@ int ldc_set_local_description(int pc_id, const char* type) {
 }
 
 int ldc_set_remote_description(int pc_id, const char* sdp, const char* type) {
-    return rtcSetRemoteDescription(pc_id, sdp, type);
+    fprintf(stderr, "[LDC-NATIVE] ldc_set_remote_description(pc=%d, type=%s, sdp_len=%d)\n",
+            pc_id, type ? type : "(null)", sdp ? (int)strlen(sdp) : 0);
+    fflush(stderr);
+    int ret = rtcSetRemoteDescription(pc_id, sdp, type);
+    fprintf(stderr, "[LDC-NATIVE] rtcSetRemoteDescription returned %d\n", ret);
+    fflush(stderr);
+    return ret;
 }
 
 int ldc_add_remote_candidate(int pc_id, const char* candidate, const char* mid) {
@@ -364,6 +391,8 @@ char* ldc_get_remote_description_type(int pc_id) {
 }
 
 int ldc_add_track(int pc_id, const char* track_init_json) {
+    fprintf(stderr, "[LDC-NATIVE] ldc_add_track(pc=%d, json=%s)\n", pc_id, track_init_json ? track_init_json : "(null)");
+    fflush(stderr);
     std::string json(track_init_json ? track_init_json : "");
 
     rtcTrackInit init = {};
@@ -400,6 +429,8 @@ int ldc_add_track(int pc_id, const char* track_init_json) {
     init.profile = profile.empty() ? nullptr : profile.c_str();
 
     int tr = rtcAddTrackEx(pc_id, &init);
+    fprintf(stderr, "[LDC-NATIVE] rtcAddTrackEx returned tr=%d\n", tr);
+    fflush(stderr);
     if (tr < 0) return tr;
 
     setup_track_callbacks(tr);

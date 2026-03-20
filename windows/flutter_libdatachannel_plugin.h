@@ -11,8 +11,6 @@
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <string>
-#include <variant>
 #include <vector>
 
 namespace flutter_libdatachannel {
@@ -27,17 +25,11 @@ class FlutterLibdatachannelPlugin : public flutter::Plugin {
   FlutterLibdatachannelPlugin(const FlutterLibdatachannelPlugin&) = delete;
   FlutterLibdatachannelPlugin& operator=(const FlutterLibdatachannelPlugin&) = delete;
 
- private:
-  struct PendingEvent {
-    enum class Kind { Json, Binary };
-    Kind kind;
-    // Json variant
-    std::string json;
-    // Binary variant
-    int tr_id = 0;
-    std::vector<uint8_t> data;
-  };
+  // Called from libdatachannel worker threads to enqueue events for delivery
+  // on the platform thread.
+  void EnqueueEvent(flutter::EncodableMap map);
 
+ private:
   static constexpr UINT kDrainMessage = WM_APP + 0x4C44;
 
   void HandleMethodCall(
@@ -47,15 +39,16 @@ class FlutterLibdatachannelPlugin : public flutter::Plugin {
   void SetupEventChannel(flutter::PluginRegistrarWindows *registrar);
   void DrainEventQueue();
 
+  static LRESULT CALLBACK DrainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
   flutter::PluginRegistrarWindows *registrar_;
   std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>> event_channel_;
   std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink_;
   std::mutex sink_mutex_;
 
-  std::queue<PendingEvent> event_queue_;
+  std::queue<flutter::EncodableMap> event_queue_;
   std::mutex queue_mutex_;
-  HWND hwnd_ = nullptr;
-  int window_proc_delegate_id_ = 0;
+  HWND hwnd_ = nullptr;  // hidden message-only window for thread marshalling
 };
 
 }  // namespace flutter_libdatachannel
