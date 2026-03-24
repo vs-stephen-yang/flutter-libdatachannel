@@ -4,6 +4,7 @@
 #include <android/log.h>
 
 #include "flutter_libdatachannel.h"
+#include "ldc_dump.h"
 
 #define LOG_TAG "FlutterLibdatachannel"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -223,6 +224,73 @@ JNIEXPORT jint JNICALL
 Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeChainRtcpSrReporter(
     JNIEnv* env, jobject thiz, jint tr_id) {
     return ldc_chain_rtcp_sr_reporter(tr_id);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeStartRecording(
+    JNIEnv* env, jobject thiz, jint tr_id, jstring file_path, jint codec) {
+    const char* path = file_path ? env->GetStringUTFChars(file_path, nullptr) : nullptr;
+    int result = ldc_dump::start_recording(tr_id, path, codec);
+    if (path) env->ReleaseStringUTFChars(file_path, path);
+    return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeStopRecording(
+    JNIEnv* env, jobject thiz, jint tr_id) {
+    return ldc_dump::stop_recording(tr_id);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeStartPlayback(
+    JNIEnv* env, jobject thiz, jint tr_id, jstring file_path, jdouble speed) {
+    const char* path = file_path ? env->GetStringUTFChars(file_path, nullptr) : nullptr;
+    int result = ldc_dump::start_playback(tr_id, path, speed, [](int id) {
+        JNIEnv* env = nullptr;
+        bool attached = false;
+        if (g_jvm) {
+            g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+            if (!env) {
+                if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+                    attached = true;
+                } else {
+                    return;
+                }
+            }
+        }
+        if (!env) return;
+        {
+            std::lock_guard<std::mutex> lock(g_jni_mutex);
+            if (g_event_handler && g_on_event_method) {
+                std::string json = "{\"event\":\"onPlaybackComplete\",\"trId\":" +
+                                   std::to_string(id) + "}";
+                jstring jstr = env->NewStringUTF(json.c_str());
+                env->CallVoidMethod(g_event_handler, g_on_event_method, jstr);
+                env->DeleteLocalRef(jstr);
+            }
+        }
+        if (attached) g_jvm->DetachCurrentThread();
+    });
+    if (path) env->ReleaseStringUTFChars(file_path, path);
+    return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativePausePlayback(
+    JNIEnv* env, jobject thiz, jint tr_id) {
+    return ldc_dump::pause_playback(tr_id);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeResumePlayback(
+    JNIEnv* env, jobject thiz, jint tr_id) {
+    return ldc_dump::resume_playback(tr_id);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeStopPlayback(
+    JNIEnv* env, jobject thiz, jint tr_id) {
+    return ldc_dump::stop_playback(tr_id);
 }
 
 } // extern "C"

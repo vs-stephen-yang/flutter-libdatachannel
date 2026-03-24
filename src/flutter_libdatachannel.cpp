@@ -1,4 +1,5 @@
 #include "flutter_libdatachannel.h"
+#include "ldc_dump.h"
 #include <rtc/rtc.h>
 
 #include <cstdio>
@@ -246,10 +247,11 @@ void setup_track_callbacks(int tr) {
         (void)p;
         fprintf(stderr, "[LDC-NATIVE] onTrackMessage tr=%d size=%d\n", id, size);
         fflush(stderr);
+        int actual = size >= 0 ? size : -size;
+        ldc_dump::on_rtp_packet(id, reinterpret_cast<const uint8_t*>(message), actual);
         if (size >= 0) {
             fire_binary_event(id, reinterpret_cast<const uint8_t*>(message), size);
         } else {
-            int actual = -size;
             fire_binary_event(id, reinterpret_cast<const uint8_t*>(message), actual);
         }
         // Diagnostic: fire a JSON event so we can see in the log
@@ -287,6 +289,7 @@ void ldc_init(void) {
 }
 
 void ldc_cleanup(void) {
+    ldc_dump::cleanup();
     rtcCleanup();
 }
 

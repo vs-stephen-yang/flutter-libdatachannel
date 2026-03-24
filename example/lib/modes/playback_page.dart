@@ -30,6 +30,7 @@ class PlaybackPageState extends State<PlaybackPage> {
   double _selectedSpeed = 1.0;
   final _logMessages = <String>[];
   final _scrollController = ScrollController();
+  Timer? _statsTimer;
 
   @override
   void initState() {
@@ -126,11 +127,17 @@ class PlaybackPageState extends State<PlaybackPage> {
       // Wait for connection + track to stabilize
       await Future.delayed(const Duration(milliseconds: 500));
 
+      // Start stats polling
+      _statsTimer = Timer.periodic(const Duration(seconds: 2), (_) => _logStats());
+
       // Start playback
       setState(() => _status = 'playing');
       _log('Starting playback at ${_selectedSpeed}x speed...');
       await _player.play(_ldcSendTrack!, _selectedFile!,
           speed: _selectedSpeed);
+      _statsTimer?.cancel();
+      _statsTimer = null;
+      await _logStats();
       _log('Playback complete');
       setState(() => _status = 'done');
     } catch (e) {
@@ -157,7 +164,37 @@ class PlaybackPageState extends State<PlaybackPage> {
     setState(() => _status = 'done');
   }
 
+  Future<void> _logStats() async {
+    if (_fwrtcPc == null) return;
+    try {
+      final stats = await _fwrtcPc!.getStats();
+      for (final report in stats) {
+        final values = report.values;
+        final kind = values['kind'] ?? '';
+        if (report.type == 'inbound-rtp' && kind == 'video') {
+          final msg = '[stats] pkts=${values['packetsReceived']} '
+              'bytes=${values['bytesReceived']} '
+              'lost=${values['packetsLost']} '
+              'jitter=${values['jitter']}\n'
+              '[stats] framesRecv=${values['framesReceived']} '
+              'decoded=${values['framesDecoded']} '
+              'dropped=${values['framesDropped']} '
+              'keyFrames=${values['keyFramesDecoded']}\n'
+              '[stats] pli=${values['pliCount']} '
+              'nack=${values['nackCount']} '
+              'fir=${values['firCount']}';
+          _log(msg);
+          debugPrint(msg);
+        }
+      }
+    } catch (e) {
+      _log('[stats] Error: $e');
+    }
+  }
+
   Future<void> _cleanup() async {
+    _statsTimer?.cancel();
+    _statsTimer = null;
     if (_player.isPlaying) await _player.stop();
     await _ldcSendTrack?.dispose();
     _ldcSendTrack = null;

@@ -40,6 +40,12 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
     private external fun nativeSetOpusPacketizer(trId: Int, initJson: String?): Int
     private external fun nativeChainRtcpReceivingSession(trId: Int): Int
     private external fun nativeChainRtcpSrReporter(trId: Int): Int
+    private external fun nativeStartRecording(trId: Int, filePath: String?, codec: Int): Int
+    private external fun nativeStopRecording(trId: Int): Int
+    private external fun nativeStartPlayback(trId: Int, filePath: String?, speed: Double): Int
+    private external fun nativePausePlayback(trId: Int): Int
+    private external fun nativeResumePlayback(trId: Int): Int
+    private external fun nativeStopPlayback(trId: Int): Int
 
     // Called from JNI when events arrive
     @Suppress("unused")
@@ -174,6 +180,43 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
             "chainRtcpSrReporter" -> {
                 val ret = nativeChainRtcpSrReporter(call.argument<Int>("trId")!!)
                 if (ret < 0) result.error("CHAIN_FAILED", "Failed to chain RTCP SR reporter", null)
+                else result.success(null)
+            }
+            "startRecording" -> {
+                val trId = call.argument<Int>("trId")!!
+                val filePath = call.argument<String>("filePath")
+                val codec = call.argument<Int>("codec") ?: 0
+                val ret = nativeStartRecording(trId, filePath, codec)
+                if (ret < 0) result.error("START_RECORDING_FAILED", "Failed to start recording", null)
+                else result.success(null)
+            }
+            "stopRecording" -> {
+                val trId = call.argument<Int>("trId")!!
+                val ret = nativeStopRecording(trId)
+                if (ret < 0) result.error("STOP_RECORDING_FAILED", "Failed to stop recording", null)
+                else result.success(null)
+            }
+            "startPlayback" -> {
+                val trId = call.argument<Int>("trId")!!
+                val filePath = call.argument<String>("filePath")
+                val speed = call.argument<Double>("speed") ?: 1.0
+                val ret = nativeStartPlayback(trId, filePath, speed)
+                if (ret < 0) result.error("START_PLAYBACK_FAILED", "Failed to start playback", null)
+                else result.success(null)
+            }
+            "pausePlayback" -> {
+                val ret = nativePausePlayback(call.argument<Int>("trId")!!)
+                if (ret < 0) result.error("PAUSE_PLAYBACK_FAILED", "Failed to pause playback", null)
+                else result.success(null)
+            }
+            "resumePlayback" -> {
+                val ret = nativeResumePlayback(call.argument<Int>("trId")!!)
+                if (ret < 0) result.error("RESUME_PLAYBACK_FAILED", "Failed to resume playback", null)
+                else result.success(null)
+            }
+            "stopPlayback" -> {
+                val ret = nativeStopPlayback(call.argument<Int>("trId")!!)
+                if (ret < 0) result.error("STOP_PLAYBACK_FAILED", "Failed to stop playback", null)
                 else result.success(null)
             }
             else -> result.notImplemented()

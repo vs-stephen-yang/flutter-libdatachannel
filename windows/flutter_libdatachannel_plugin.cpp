@@ -10,6 +10,8 @@
 
 #include <rtc/rtc.h>
 
+#include "ldc_dump.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -78,6 +80,19 @@ flutter::EncodableMap GetMapArg(const flutter::EncodableMap& args, const std::st
         return std::get<flutter::EncodableMap>(it->second);
     }
     return {};
+}
+
+double GetDoubleArg(const flutter::EncodableMap& args, const std::string& key, double default_val = 0.0) {
+    auto it = args.find(flutter::EncodableValue(key));
+    if (it != args.end()) {
+        if (std::holds_alternative<double>(it->second))
+            return std::get<double>(it->second);
+        if (std::holds_alternative<int>(it->second))
+            return static_cast<double>(std::get<int>(it->second));
+        if (std::holds_alternative<int64_t>(it->second))
+            return static_cast<double>(std::get<int64_t>(it->second));
+    }
+    return default_val;
 }
 
 std::vector<uint8_t> GetBytesArg(const flutter::EncodableMap& args, const std::string& key) {
@@ -164,6 +179,7 @@ void SetupTrackCallbacks(int tr) {
     });
     rtcSetMessageCallback(tr, [](int id, const char* message, int size, void*) {
         int actual = size >= 0 ? size : -size;
+        ldc_dump::on_rtp_packet(id, reinterpret_cast<const uint8_t*>(message), actual);
         auto m = MakeEvent("onTrackMessage");
         m[flutter::EncodableValue("trId")] = flutter::EncodableValue(id);
         m[flutter::EncodableValue("data")] = flutter::EncodableValue(
@@ -317,6 +333,7 @@ FlutterLibdatachannelPlugin::~FlutterLibdatachannelPlugin() {
     hwnd_ = nullptr;
   }
 
+  ldc_dump::cleanup();
   rtcCleanup();
   g_plugin = nullptr;
 }
@@ -557,6 +574,57 @@ void FlutterLibdatachannelPlugin::HandleMethodCall(
     } else {
       result->Success();
     }
+
+  } else if (method == "startRecording") {
+    int tr_id = GetIntArg(args, "trId");
+    std::string file_path = GetStringArg(args, "filePath");
+    int codec = GetIntArg(args, "codec", 0);
+    int ret = ldc_dump::start_recording(tr_id, file_path.c_str(), codec);
+    if (ret < 0) {
+      result->Error("START_RECORDING_FAILED", "Failed to start recording");
+    } else {
+      result->Success();
+    }
+
+  } else if (method == "stopRecording") {
+    int tr_id = GetIntArg(args, "trId");
+    int ret = ldc_dump::stop_recording(tr_id);
+    if (ret < 0) {
+      result->Error("STOP_RECORDING_FAILED", "Failed to stop recording");
+    } else {
+      result->Success();
+    }
+
+  } else if (method == "startPlayback") {
+    int tr_id = GetIntArg(args, "trId");
+    std::string file_path = GetStringArg(args, "filePath");
+    double speed = GetDoubleArg(args, "speed", 1.0);
+    int ret = ldc_dump::start_playback(tr_id, file_path.c_str(), speed,
+        [](int id) {
+          auto m = MakeEvent("onPlaybackComplete");
+          m[flutter::EncodableValue("trId")] = flutter::EncodableValue(id);
+          if (g_plugin) g_plugin->EnqueueEvent(std::move(m));
+        });
+    if (ret < 0) {
+      result->Error("START_PLAYBACK_FAILED", "Failed to start playback");
+    } else {
+      result->Success();
+    }
+
+  } else if (method == "pausePlayback") {
+    int tr_id = GetIntArg(args, "trId");
+    ldc_dump::pause_playback(tr_id);
+    result->Success();
+
+  } else if (method == "resumePlayback") {
+    int tr_id = GetIntArg(args, "trId");
+    ldc_dump::resume_playback(tr_id);
+    result->Success();
+
+  } else if (method == "stopPlayback") {
+    int tr_id = GetIntArg(args, "trId");
+    ldc_dump::stop_playback(tr_id);
+    result->Success();
 
   } else {
     result->NotImplemented();

@@ -11,6 +11,7 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libdatachannel"
 
 add_library(flutter_libdatachannel_native SHARED
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/flutter_libdatachannel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/ldc_dump.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main/jni/flutter_libdatachannel_jni.cpp"
 )
 

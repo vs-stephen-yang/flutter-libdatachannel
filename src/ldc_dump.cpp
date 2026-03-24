@@ -1,0 +1,626 @@
+﻿#include "ldc_dump.h"
+
+#include <rtc/rtc.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace ldc_dump {
+
+// ---------------------------------------------------------------------------
+// File helpers
+// ---------------------------------------------------------------------------
+
+#ifdef _WIN32
+static FILE* open_file(const char* path, const char* mode) {
+    // Convert UTF-8 path to UTF-16 for _wfopen
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (wlen <= 0) return nullptr;
+    std::vector<wchar_t> wpath(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wlen);
+
+    int wmlen = MultiByteToWideChar(CP_UTF8, 0, mode, -1, nullptr, 0);
+    if (wmlen <= 0) return nullptr;
+    std::vector<wchar_t> wmode(wmlen);
+    MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode.data(), wmlen);
+
+    return _wfopen(wpath.data(), wmode.data());
+}
+#else
+static FILE* open_file(const char* path, const char* mode) {
+    return fopen(path, mode);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Dump format constants (must match dump_format.dart)
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t kDumpMagic   = 0x43444C46; // "FLDC" LE
+static constexpr uint32_t kDumpVersion = 1;
+static constexpr int kDumpHeaderSize       = 16;
+static constexpr int kDumpRecordHeaderSize = 12; // 8B timestamp + 4B length
+
+// ---------------------------------------------------------------------------
+// Recording state
+// ---------------------------------------------------------------------------
+
+struct RecordingState {
+    FILE* file = nullptr;
+    std::chrono::steady_clock::time_point start_time;
+    std::atomic<bool> active{false};
+    std::mutex mutex;
+};
+
+// ---------------------------------------------------------------------------
+// Playback state
+// ---------------------------------------------------------------------------
+
+struct PlaybackState {
+    std::thread thread;
+    std::atomic<bool> playing{false};
+    std::atomic<bool> paused{false};
+    std::atomic<bool> stop_requested{false};
+    double speed = 1.0;
+    std::mutex pause_mutex;
+    std::condition_variable pause_cv;
+    CompletionCallback on_complete;
+};
+
+// ---------------------------------------------------------------------------
+// Global maps
+// ---------------------------------------------------------------------------
+
+static std::mutex g_rec_map_mutex;
+static std::unordered_map<int, std::shared_ptr<RecordingState>> g_recordings;
+
+static std::mutex g_play_map_mutex;
+static std::unordered_map<int, std::shared_ptr<PlaybackState>> g_playbacks;
+
+// ---------------------------------------------------------------------------
+// H.264 RTP depacketizer helpers
+// ---------------------------------------------------------------------------
+
+static int rtp_payload_offset(const uint8_t* pkt, int size) {
+    if (size < 12) return size;
+    int offset = 12 + (pkt[0] & 0x0F) * 4;
+    if ((pkt[0] & 0x10) != 0 && offset + 4 <= size) {
+        int ext_len = (pkt[offset + 2] << 8) | pkt[offset + 3];
+        offset += 4 + ext_len * 4;
+    }
+    return offset;
+}
+
+// Annex B start code: 00 00 00 01
+static void append_start_code(std::vector<uint8_t>& out) {
+    out.push_back(0);
+    out.push_back(0);
+    out.push_back(0);
+    out.push_back(1);
+}
+
+static void append_nalu_with_start_code(std::vector<uint8_t>& out,
+                                         const uint8_t* data, int len) {
+    append_start_code(out);
+    out.insert(out.end(), data, data + len);
+}
+
+struct Depacketizer {
+    std::vector<uint8_t> fu_buffer;
+
+    void process(const uint8_t* rtp, int rtp_size,
+                 std::vector<uint8_t>& frame_buf) {
+        int pay_off = rtp_payload_offset(rtp, rtp_size);
+        if (pay_off >= rtp_size) return;
+
+        const uint8_t* payload = rtp + pay_off;
+        int payload_len = rtp_size - pay_off;
+
+        // Handle RTP padding
+        if ((rtp[0] & 0x20) != 0 && payload_len > 0) {
+            int pad_len = rtp[rtp_size - 1];
+            payload_len -= pad_len;
+            if (payload_len <= 0) return;
+        }
+
+        if (payload_len <= 0) return;
+        int nal_type = payload[0] & 0x1F;
+
+        if (nal_type >= 1 && nal_type <= 23) {
+            // Single NAL unit
+            append_nalu_with_start_code(frame_buf, payload, payload_len);
+        } else if (nal_type == 24) {
+            // STAP-A
+            int off = 1;
+            while (off + 2 <= payload_len) {
+                int len = (payload[off] << 8) | payload[off + 1];
+                off += 2;
+                if (off + len > payload_len) break;
+                append_nalu_with_start_code(frame_buf, payload + off, len);
+                off += len;
+            }
+        } else if (nal_type == 28) {
+            // FU-A
+            if (payload_len < 2) return;
+            uint8_t fu_indicator = payload[0];
+            uint8_t fu_header = payload[1];
+            bool start = (fu_header & 0x80) != 0;
+            bool end   = (fu_header & 0x40) != 0;
+            uint8_t frag_nal_type = fu_header & 0x1F;
+            uint8_t nri = fu_indicator & 0x60;
+
+            if (start) {
+                fu_buffer.clear();
+                fu_buffer.push_back(nri | frag_nal_type);
+            }
+            if (payload_len > 2) {
+                fu_buffer.insert(fu_buffer.end(), payload + 2,
+                                 payload + payload_len);
+            }
+            if (end) {
+                append_nalu_with_start_code(frame_buf, fu_buffer.data(),
+                                            static_cast<int>(fu_buffer.size()));
+                fu_buffer.clear();
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Playback worker
+// ---------------------------------------------------------------------------
+
+static void playback_thread_func(std::shared_ptr<PlaybackState> state,
+                                  int tr_id, std::string file_path) {
+    fprintf(stderr, "[LDC-DUMP] playback_thread_func started tr=%d file=%s\n",
+            tr_id, file_path.c_str());
+    fflush(stderr);
+
+    FILE* f = open_file(file_path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "[LDC-DUMP] Failed to open file\n");
+        fflush(stderr);
+        state->playing = false;
+        if (state->on_complete) state->on_complete(tr_id);
+        return;
+    }
+
+    // Read and validate header
+    uint8_t hdr[kDumpHeaderSize];
+    if (fread(hdr, 1, kDumpHeaderSize, f) != kDumpHeaderSize) {
+        fclose(f);
+        state->playing = false;
+        if (state->on_complete) state->on_complete(tr_id);
+        return;
+    }
+    uint32_t magic;
+    memcpy(&magic, hdr, 4);
+    if (magic != kDumpMagic) {
+        fclose(f);
+        state->playing = false;
+        if (state->on_complete) state->on_complete(tr_id);
+        return;
+    }
+
+    // Pass 1: PT detection scan — find primary payload type
+    std::unordered_map<int, int> pt_counts;
+    uint8_t rec_hdr[kDumpRecordHeaderSize];
+    uint8_t pt_peek[2]; // enough to read PT byte from RTP header
+    uint8_t scratch[4096];
+
+    while (fread(rec_hdr, 1, kDumpRecordHeaderSize, f) == kDumpRecordHeaderSize) {
+        uint32_t payload_len;
+        memcpy(&payload_len, rec_hdr + 8, 4);
+
+        if (payload_len >= 2) {
+            if (fread(pt_peek, 1, 2, f) != 2) break;
+            int pt = pt_peek[1] & 0x7F;
+            pt_counts[pt]++;
+
+            // Read and discard remaining payload bytes
+            uint32_t remaining = payload_len - 2;
+            while (remaining > 0) {
+                uint32_t chunk = remaining > sizeof(scratch)
+                                     ? static_cast<uint32_t>(sizeof(scratch))
+                                     : remaining;
+                if (fread(scratch, 1, chunk, f) != chunk) goto done_scan;
+                remaining -= chunk;
+            }
+        } else {
+            // Tiny payload, skip
+            uint32_t remaining = payload_len;
+            while (remaining > 0) {
+                uint32_t chunk = remaining > sizeof(scratch)
+                                     ? static_cast<uint32_t>(sizeof(scratch))
+                                     : remaining;
+                if (fread(scratch, 1, chunk, f) != chunk) goto done_scan;
+                remaining -= chunk;
+            }
+        }
+    }
+done_scan:
+
+    int primary_pt = -1;
+    int max_count = 0;
+    for (auto& [pt, count] : pt_counts) {
+        if (count > max_count) {
+            max_count = count;
+            primary_pt = pt;
+        }
+    }
+    fprintf(stderr, "[LDC-DUMP] Primary PT: %d (%d packets)\n", primary_pt, max_count);
+    fflush(stderr);
+
+    // Rewind to first record
+    fseek(f, kDumpHeaderSize, SEEK_SET);
+
+    // Pass 2: streaming playback
+    Depacketizer depack;
+    int total_records = 0;
+    int filtered_records = 0;
+    int frames_sent = 0;
+    int send_errors = 0;
+    std::vector<uint8_t> pkt_buf;
+    std::vector<uint8_t> frame_buf;
+    uint32_t prev_rtp_ts = 0;
+    bool have_prev_ts = false;
+    int64_t first_timestamp_us = -1;
+    auto wall_start = std::chrono::steady_clock::now();
+    bool wall_start_set = false;
+
+    while (!state->stop_requested &&
+           fread(rec_hdr, 1, kDumpRecordHeaderSize, f) == kDumpRecordHeaderSize) {
+
+        uint64_t timestamp_us;
+        uint32_t payload_len;
+        memcpy(&timestamp_us, rec_hdr, 8);
+        memcpy(&payload_len, rec_hdr + 8, 4);
+
+        // Read payload
+        pkt_buf.resize(payload_len);
+        if (fread(pkt_buf.data(), 1, payload_len, f) != payload_len) break;
+
+        total_records++;
+        if (payload_len < 12) continue; // too small for RTP
+
+        // Filter by primary PT
+        int pt = pkt_buf[1] & 0x7F;
+        if (primary_pt >= 0 && pt != primary_pt) {
+            filtered_records++;
+            continue;
+        }
+
+        // Extract RTP timestamp
+        uint32_t rtp_ts = (static_cast<uint32_t>(pkt_buf[4]) << 24) |
+                          (static_cast<uint32_t>(pkt_buf[5]) << 16) |
+                          (static_cast<uint32_t>(pkt_buf[6]) << 8) |
+                          static_cast<uint32_t>(pkt_buf[7]);
+
+        // When RTP timestamp changes, flush accumulated frame
+        int64_t delay_us = 0;
+        if (have_prev_ts && rtp_ts != prev_rtp_ts && !frame_buf.empty()) {
+            // Timing
+            if (state->speed > 0 && first_timestamp_us >= 0) {
+                if (!wall_start_set) {
+                    wall_start = std::chrono::steady_clock::now();
+                    wall_start_set = true;
+                }
+                auto now = std::chrono::steady_clock::now();
+                int64_t target_us = static_cast<int64_t>(
+                    (static_cast<double>(timestamp_us) -
+                     static_cast<double>(first_timestamp_us)) /
+                    state->speed);
+                auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   now - wall_start)
+                                   .count();
+                delay_us = target_us - elapsed;
+                if (delay_us > 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(delay_us));
+                }
+            }
+
+            // Check stop/pause after sleep
+            if (state->stop_requested) break;
+            if (state->paused) {
+                std::unique_lock<std::mutex> lk(state->pause_mutex);
+                state->pause_cv.wait(lk, [&] {
+                    return !state->paused || state->stop_requested;
+                });
+                // Reset wall clock after unpause
+                wall_start_set = false;
+                first_timestamp_us = static_cast<int64_t>(timestamp_us);
+                if (state->stop_requested) break;
+            }
+
+            // Set RTP timestamp so the packetizer stamps outgoing packets
+            // with proper timing — prevents jitter buffer stalls on the receiver
+            rtcSetTrackRtpTimestamp(tr_id, prev_rtp_ts);
+
+            // Send frame
+            int send_ret = rtcSendMessage(tr_id,
+                           reinterpret_cast<const char*>(frame_buf.data()),
+                           static_cast<int>(frame_buf.size()));
+            frames_sent++;
+            if (send_ret < 0) {
+                send_errors++;
+                if (send_errors <= 3) {
+                    fprintf(stderr, "[LDC-DUMP] rtcSendMessage FAILED ret=%d frame=%d size=%d\n",
+                            send_ret, frames_sent, (int)frame_buf.size());
+                    fflush(stderr);
+                }
+            }
+            frame_buf.clear();
+        }
+
+        if (first_timestamp_us < 0) {
+            first_timestamp_us = static_cast<int64_t>(timestamp_us);
+        }
+
+        prev_rtp_ts = rtp_ts;
+        have_prev_ts = true;
+
+        depack.process(pkt_buf.data(), static_cast<int>(payload_len), frame_buf);
+    }
+
+    // Flush last frame
+    if (!state->stop_requested && !frame_buf.empty()) {
+        rtcSetTrackRtpTimestamp(tr_id, prev_rtp_ts);
+        int ret = rtcSendMessage(tr_id,
+                       reinterpret_cast<const char*>(frame_buf.data()),
+                       static_cast<int>(frame_buf.size()));
+        frames_sent++;
+        if (ret < 0) send_errors++;
+        fprintf(stderr, "[LDC-DUMP] Last frame sent (size=%d, ret=%d)\n",
+                (int)frame_buf.size(), ret);
+        fflush(stderr);
+    }
+
+    fclose(f);
+
+    fprintf(stderr, "[LDC-DUMP] Playback finished: records=%d filtered=%d frames_sent=%d send_errors=%d\n",
+            total_records, filtered_records, frames_sent, send_errors);
+    fflush(stderr);
+
+    state->playing = false;
+
+    if (state->on_complete) {
+        state->on_complete(tr_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recording API
+// ---------------------------------------------------------------------------
+
+int start_recording(int tr_id, const char* file_path, int codec) {
+    auto state = std::make_shared<RecordingState>();
+
+    state->file = open_file(file_path, "wb");
+    if (!state->file) return -1;
+
+    // Write header
+    uint8_t hdr[kDumpHeaderSize] = {};
+    uint32_t magic = kDumpMagic;
+    uint32_t version = kDumpVersion;
+    uint32_t codec_val = static_cast<uint32_t>(codec);
+    memcpy(hdr, &magic, 4);
+    memcpy(hdr + 4, &version, 4);
+    memcpy(hdr + 8, &codec_val, 4);
+    // hdr[12..15] = 0 (reserved)
+
+    if (fwrite(hdr, 1, kDumpHeaderSize, state->file) != kDumpHeaderSize) {
+        fclose(state->file);
+        return -1;
+    }
+    fflush(state->file);
+
+    state->start_time = std::chrono::steady_clock::now();
+    state->active = true;
+
+    {
+        std::lock_guard<std::mutex> lock(g_rec_map_mutex);
+        // Stop any existing recording on this track
+        auto it = g_recordings.find(tr_id);
+        if (it != g_recordings.end()) {
+            it->second->active = false;
+            std::lock_guard<std::mutex> sl(it->second->mutex);
+            if (it->second->file) {
+                fclose(it->second->file);
+                it->second->file = nullptr;
+            }
+        }
+        g_recordings[tr_id] = state;
+    }
+
+    return 0;
+}
+
+int stop_recording(int tr_id) {
+    std::shared_ptr<RecordingState> state;
+    {
+        std::lock_guard<std::mutex> lock(g_rec_map_mutex);
+        auto it = g_recordings.find(tr_id);
+        if (it == g_recordings.end()) return -1;
+        state = it->second;
+        g_recordings.erase(it);
+    }
+
+    state->active = false;
+    std::lock_guard<std::mutex> sl(state->mutex);
+    if (state->file) {
+        fflush(state->file);
+        fclose(state->file);
+        state->file = nullptr;
+    }
+    return 0;
+}
+
+bool is_recording(int tr_id) {
+    std::lock_guard<std::mutex> lock(g_rec_map_mutex);
+    auto it = g_recordings.find(tr_id);
+    return it != g_recordings.end() && it->second->active;
+}
+
+void on_rtp_packet(int tr_id, const uint8_t* data, int size) {
+    std::shared_ptr<RecordingState> state;
+    {
+        std::lock_guard<std::mutex> lock(g_rec_map_mutex);
+        auto it = g_recordings.find(tr_id);
+        if (it == g_recordings.end()) return;
+        state = it->second;
+    }
+
+    if (!state->active) return;
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       now - state->start_time)
+                       .count();
+    uint64_t timestamp_us = static_cast<uint64_t>(elapsed);
+    uint32_t length = static_cast<uint32_t>(size);
+
+    uint8_t rec_hdr[kDumpRecordHeaderSize];
+    memcpy(rec_hdr, &timestamp_us, 8);
+    memcpy(rec_hdr + 8, &length, 4);
+
+    std::lock_guard<std::mutex> sl(state->mutex);
+    if (!state->active || !state->file) return;
+    if (fwrite(rec_hdr, 1, kDumpRecordHeaderSize, state->file) != kDumpRecordHeaderSize ||
+        fwrite(data, 1, size, state->file) != static_cast<size_t>(size)) {
+        state->active = false;
+        fprintf(stderr, "[LDC-DUMP] Write error during recording tr=%d, deactivating\n", tr_id);
+        fflush(stderr);
+        return;
+    }
+
+    // Periodic flush — every ~1s worth of data at typical bitrates
+    static thread_local int flush_counter = 0;
+    if (++flush_counter >= 100) {
+        fflush(state->file);
+        flush_counter = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Playback API
+// ---------------------------------------------------------------------------
+
+int start_playback(int tr_id, const char* file_path, double speed,
+                   CompletionCallback on_complete) {
+    // Stop any existing playback on this track
+    stop_playback(tr_id);
+
+    auto state = std::make_shared<PlaybackState>();
+    state->playing = true;
+    state->speed = speed;
+    state->on_complete = std::move(on_complete);
+
+    std::string path_copy(file_path);
+
+    {
+        std::lock_guard<std::mutex> lock(g_play_map_mutex);
+        g_playbacks[tr_id] = state;
+    }
+
+    state->thread = std::thread(playback_thread_func, state, tr_id,
+                                std::move(path_copy));
+
+    return 0;
+}
+
+int pause_playback(int tr_id) {
+    std::shared_ptr<PlaybackState> state;
+    {
+        std::lock_guard<std::mutex> lock(g_play_map_mutex);
+        auto it = g_playbacks.find(tr_id);
+        if (it == g_playbacks.end()) return -1;
+        state = it->second;
+    }
+    state->paused = true;
+    return 0;
+}
+
+int resume_playback(int tr_id) {
+    std::shared_ptr<PlaybackState> state;
+    {
+        std::lock_guard<std::mutex> lock(g_play_map_mutex);
+        auto it = g_playbacks.find(tr_id);
+        if (it == g_playbacks.end()) return -1;
+        state = it->second;
+    }
+    state->paused = false;
+    state->pause_cv.notify_all();
+    return 0;
+}
+
+int stop_playback(int tr_id) {
+    std::shared_ptr<PlaybackState> state;
+    {
+        std::lock_guard<std::mutex> lock(g_play_map_mutex);
+        auto it = g_playbacks.find(tr_id);
+        if (it == g_playbacks.end()) return 0; // not an error
+        state = it->second;
+        g_playbacks.erase(it);
+    }
+
+    // Signal stop and unblock pause
+    state->stop_requested = true;
+    state->paused = false;
+    state->pause_cv.notify_all();
+
+    // Join thread (map lock is NOT held)
+    if (state->thread.joinable()) {
+        state->thread.join();
+    }
+
+    return 0;
+}
+
+void cleanup() {
+    // Stop all recordings
+    {
+        std::lock_guard<std::mutex> lock(g_rec_map_mutex);
+        for (auto& [id, state] : g_recordings) {
+            state->active = false;
+            std::lock_guard<std::mutex> sl(state->mutex);
+            if (state->file) {
+                fclose(state->file);
+                state->file = nullptr;
+            }
+        }
+        g_recordings.clear();
+    }
+
+    // Stop all playbacks — collect first, then join outside lock
+    std::vector<std::shared_ptr<PlaybackState>> to_stop;
+    {
+        std::lock_guard<std::mutex> lock(g_play_map_mutex);
+        for (auto& [id, state] : g_playbacks) {
+            state->stop_requested = true;
+            state->paused = false;
+            state->pause_cv.notify_all();
+            to_stop.push_back(state);
+        }
+        g_playbacks.clear();
+    }
+    for (auto& state : to_stop) {
+        if (state->thread.joinable()) {
+            state->thread.join();
+        }
+    }
+}
+
+} // namespace ldc_dump
