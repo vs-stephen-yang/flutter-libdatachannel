@@ -29,6 +29,10 @@ class ReceiveDumpPageState extends State<ReceiveDumpPage> {
   int? _dumpFileSize;
   final _logMessages = <String>[];
   final _scrollController = ScrollController();
+  Timer? _statsTimer;
+  int _prevFramesSent = 0;
+  int _prevFramesEncoded = 0;
+  DateTime _prevStatsTime = DateTime.now();
 
   @override
   void initState() {
@@ -141,6 +145,13 @@ class ReceiveDumpPageState extends State<ReceiveDumpPage> {
       _dumpFilePath = '${dir.path}/dump_$timestamp.fldc';
       await _recorder.start(_ldcTrack!, _dumpFilePath!);
       _log('Recording to: $_dumpFilePath');
+
+      // Start stats polling
+      _prevFramesSent = 0;
+      _prevFramesEncoded = 0;
+      _prevStatsTime = DateTime.now();
+      _statsTimer = Timer.periodic(const Duration(seconds: 1), (_) => _logStats());
+
       setState(() => _status = 'recording');
     } catch (e) {
       _log('Error: $e');
@@ -148,9 +159,56 @@ class ReceiveDumpPageState extends State<ReceiveDumpPage> {
     }
   }
 
+  Future<void> _logStats() async {
+    if (_fwrtcPc == null) return;
+    try {
+      final stats = await _fwrtcPc!.getStats();
+      final now = DateTime.now();
+      for (final report in stats) {
+        final values = report.values;
+        final kind = values['kind'] ?? '';
+        if (report.type == 'outbound-rtp' && kind == 'video') {
+          final framesSent = (values['framesSent'] as num?)?.toInt() ?? 0;
+          final framesEncoded = (values['framesEncoded'] as num?)?.toInt() ?? 0;
+
+          // Calculate FPS over the polling interval
+          final elapsed = now.difference(_prevStatsTime).inMilliseconds / 1000.0;
+          final sendFps = elapsed > 0
+              ? (framesSent - _prevFramesSent) / elapsed
+              : 0.0;
+          final encodeFps = elapsed > 0
+              ? (framesEncoded - _prevFramesEncoded) / elapsed
+              : 0.0;
+          _prevFramesSent = framesSent;
+          _prevFramesEncoded = framesEncoded;
+          _prevStatsTime = now;
+
+          final msg = '[stats] sendFps=${sendFps.toStringAsFixed(1)} '
+              'encodeFps=${encodeFps.toStringAsFixed(1)} '
+              'framesSent=$framesSent '
+              'encoded=$framesEncoded '
+              'keyFrames=${values['keyFramesEncoded']}\n'
+              '[stats] pkts=${values['packetsSent']} '
+              'bytes=${values['bytesSent']} '
+              'retransmitted=${values['retransmittedPacketsSent']}\n'
+              '[stats] pli=${values['pliCount']} '
+              'nack=${values['nackCount']} '
+              'fir=${values['firCount']}';
+          _log(msg);
+          debugPrint(msg);
+        }
+      }
+    } catch (e) {
+      _log('[stats] Error: $e');
+    }
+  }
+
   Future<void> _stopRecording() async {
     setState(() => _status = 'stopping');
     try {
+      _statsTimer?.cancel();
+      _statsTimer = null;
+      await _logStats();
       await _recorder.stop();
       _log('Recording stopped');
 
@@ -171,6 +229,8 @@ class ReceiveDumpPageState extends State<ReceiveDumpPage> {
   }
 
   Future<void> _cleanup() async {
+    _statsTimer?.cancel();
+    _statsTimer = null;
     if (_recorder.isRecording) await _recorder.stop();
     await _ldcTrack?.dispose();
     _ldcTrack = null;

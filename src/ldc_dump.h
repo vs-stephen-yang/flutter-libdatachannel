@@ -7,7 +7,9 @@
 namespace ldc_dump {
 
 // Recording
-int start_recording(int tr_id, const char* file_path, int codec);
+using ErrorCallback = std::function<void(int tr_id)>;
+int start_recording(int tr_id, const char* file_path, int codec,
+                    ErrorCallback on_error = nullptr);
 int stop_recording(int tr_id);
 bool is_recording(int tr_id);
 // Called from message callback — writes packet if recording active

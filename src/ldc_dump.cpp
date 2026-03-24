@@ -62,6 +62,8 @@ struct RecordingState {
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> active{false};
     std::mutex mutex;
+    int flush_counter = 0;
+    ErrorCallback on_error;
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ struct PlaybackState {
 
 static std::mutex g_rec_map_mutex;
 static std::unordered_map<int, std::shared_ptr<RecordingState>> g_recordings;
+static std::atomic<int> g_active_recordings{0};
 
 static std::mutex g_play_map_mutex;
 static std::unordered_map<int, std::shared_ptr<PlaybackState>> g_playbacks;
@@ -334,7 +337,7 @@ done_scan:
 
             // Check stop/pause after sleep
             if (state->stop_requested) break;
-            if (state->paused) {
+            {
                 std::unique_lock<std::mutex> lk(state->pause_mutex);
                 state->pause_cv.wait(lk, [&] {
                     return !state->paused || state->stop_requested;
@@ -405,7 +408,8 @@ done_scan:
 // Recording API
 // ---------------------------------------------------------------------------
 
-int start_recording(int tr_id, const char* file_path, int codec) {
+int start_recording(int tr_id, const char* file_path, int codec,
+                    ErrorCallback on_error) {
     auto state = std::make_shared<RecordingState>();
 
     state->file = open_file(file_path, "wb");
@@ -428,6 +432,7 @@ int start_recording(int tr_id, const char* file_path, int codec) {
     fflush(state->file);
 
     state->start_time = std::chrono::steady_clock::now();
+    state->on_error = std::move(on_error);
     state->active = true;
 
     {
@@ -436,6 +441,7 @@ int start_recording(int tr_id, const char* file_path, int codec) {
         auto it = g_recordings.find(tr_id);
         if (it != g_recordings.end()) {
             it->second->active = false;
+            g_active_recordings.fetch_sub(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> sl(it->second->mutex);
             if (it->second->file) {
                 fclose(it->second->file);
@@ -443,6 +449,7 @@ int start_recording(int tr_id, const char* file_path, int codec) {
             }
         }
         g_recordings[tr_id] = state;
+        g_active_recordings.fetch_add(1, std::memory_order_relaxed);
     }
 
     return 0;
@@ -456,6 +463,7 @@ int stop_recording(int tr_id) {
         if (it == g_recordings.end()) return -1;
         state = it->second;
         g_recordings.erase(it);
+        g_active_recordings.fetch_sub(1, std::memory_order_relaxed);
     }
 
     state->active = false;
@@ -475,6 +483,9 @@ bool is_recording(int tr_id) {
 }
 
 void on_rtp_packet(int tr_id, const uint8_t* data, int size) {
+    if (g_active_recordings.load(std::memory_order_relaxed) == 0) return;
+    if (size <= 0) return;
+
     std::shared_ptr<RecordingState> state;
     {
         std::lock_guard<std::mutex> lock(g_rec_map_mutex);
@@ -496,22 +507,24 @@ void on_rtp_packet(int tr_id, const uint8_t* data, int size) {
     memcpy(rec_hdr, &timestamp_us, 8);
     memcpy(rec_hdr + 8, &length, 4);
 
-    std::lock_guard<std::mutex> sl(state->mutex);
-    if (!state->active || !state->file) return;
-    if (fwrite(rec_hdr, 1, kDumpRecordHeaderSize, state->file) != kDumpRecordHeaderSize ||
-        fwrite(data, 1, size, state->file) != static_cast<size_t>(size)) {
-        state->active = false;
-        fprintf(stderr, "[LDC-DUMP] Write error during recording tr=%d, deactivating\n", tr_id);
-        fflush(stderr);
-        return;
+    ErrorCallback error_cb;
+    {
+        std::lock_guard<std::mutex> sl(state->mutex);
+        if (!state->active || !state->file) return;
+        if (fwrite(rec_hdr, 1, kDumpRecordHeaderSize, state->file) != kDumpRecordHeaderSize ||
+            fwrite(data, 1, size, state->file) != static_cast<size_t>(size)) {
+            state->active = false;
+            error_cb = state->on_error;
+            fprintf(stderr, "[LDC-DUMP] Write error during recording tr=%d, deactivating\n", tr_id);
+            fflush(stderr);
+        } else if (++state->flush_counter >= 100) {
+            fflush(state->file);
+            state->flush_counter = 0;
+        }
     }
 
-    // Periodic flush — every ~1s worth of data at typical bitrates
-    static thread_local int flush_counter = 0;
-    if (++flush_counter >= 100) {
-        fflush(state->file);
-        flush_counter = 0;
-    }
+    // Fire error callback outside the state mutex to avoid deadlock
+    if (error_cb) error_cb(tr_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,13 +543,13 @@ int start_playback(int tr_id, const char* file_path, double speed,
 
     std::string path_copy(file_path);
 
+    state->thread = std::thread(playback_thread_func, state, tr_id,
+                                std::move(path_copy));
+
     {
         std::lock_guard<std::mutex> lock(g_play_map_mutex);
         g_playbacks[tr_id] = state;
     }
-
-    state->thread = std::thread(playback_thread_func, state, tr_id,
-                                std::move(path_copy));
 
     return 0;
 }
@@ -549,7 +562,10 @@ int pause_playback(int tr_id) {
         if (it == g_playbacks.end()) return -1;
         state = it->second;
     }
-    state->paused = true;
+    {
+        std::lock_guard<std::mutex> lk(state->pause_mutex);
+        state->paused = true;
+    }
     return 0;
 }
 
@@ -561,7 +577,10 @@ int resume_playback(int tr_id) {
         if (it == g_playbacks.end()) return -1;
         state = it->second;
     }
-    state->paused = false;
+    {
+        std::lock_guard<std::mutex> lk(state->pause_mutex);
+        state->paused = false;
+    }
     state->pause_cv.notify_all();
     return 0;
 }
@@ -577,8 +596,11 @@ int stop_playback(int tr_id) {
     }
 
     // Signal stop and unblock pause
-    state->stop_requested = true;
-    state->paused = false;
+    {
+        std::lock_guard<std::mutex> lk(state->pause_mutex);
+        state->stop_requested = true;
+        state->paused = false;
+    }
     state->pause_cv.notify_all();
 
     // Join thread (map lock is NOT held)
@@ -602,6 +624,7 @@ void cleanup() {
             }
         }
         g_recordings.clear();
+        g_active_recordings.store(0, std::memory_order_relaxed);
     }
 
     // Stop all playbacks — collect first, then join outside lock
@@ -609,8 +632,11 @@ void cleanup() {
     {
         std::lock_guard<std::mutex> lock(g_play_map_mutex);
         for (auto& [id, state] : g_playbacks) {
-            state->stop_requested = true;
-            state->paused = false;
+            {
+                std::lock_guard<std::mutex> lk(state->pause_mutex);
+                state->stop_requested = true;
+                state->paused = false;
+            }
             state->pause_cv.notify_all();
             to_stop.push_back(state);
         }

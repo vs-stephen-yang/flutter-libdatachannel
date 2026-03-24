@@ -31,6 +31,9 @@ class PlaybackPageState extends State<PlaybackPage> {
   final _logMessages = <String>[];
   final _scrollController = ScrollController();
   Timer? _statsTimer;
+  int _prevFramesReceived = 0;
+  int _prevFramesDecoded = 0;
+  DateTime _prevStatsTime = DateTime.now();
 
   @override
   void initState() {
@@ -128,7 +131,10 @@ class PlaybackPageState extends State<PlaybackPage> {
       await Future.delayed(const Duration(milliseconds: 500));
 
       // Start stats polling
-      _statsTimer = Timer.periodic(const Duration(seconds: 2), (_) => _logStats());
+      _prevFramesReceived = 0;
+      _prevFramesDecoded = 0;
+      _prevStatsTime = DateTime.now();
+      _statsTimer = Timer.periodic(const Duration(seconds: 1), (_) => _logStats());
 
       // Start playback
       setState(() => _status = 'playing');
@@ -168,18 +174,36 @@ class PlaybackPageState extends State<PlaybackPage> {
     if (_fwrtcPc == null) return;
     try {
       final stats = await _fwrtcPc!.getStats();
+      final now = DateTime.now();
       for (final report in stats) {
         final values = report.values;
         final kind = values['kind'] ?? '';
         if (report.type == 'inbound-rtp' && kind == 'video') {
-          final msg = '[stats] pkts=${values['packetsReceived']} '
+          final framesReceived = (values['framesReceived'] as num?)?.toInt() ?? 0;
+          final framesDecoded = (values['framesDecoded'] as num?)?.toInt() ?? 0;
+
+          // Calculate FPS over the polling interval
+          final elapsed = now.difference(_prevStatsTime).inMilliseconds / 1000.0;
+          final recvFps = elapsed > 0
+              ? (framesReceived - _prevFramesReceived) / elapsed
+              : 0.0;
+          final decodeFps = elapsed > 0
+              ? (framesDecoded - _prevFramesDecoded) / elapsed
+              : 0.0;
+          _prevFramesReceived = framesReceived;
+          _prevFramesDecoded = framesDecoded;
+          _prevStatsTime = now;
+
+          final msg = '[stats] recvFps=${recvFps.toStringAsFixed(1)} '
+              'decodeFps=${decodeFps.toStringAsFixed(1)} '
+              'framesRecv=$framesReceived '
+              'decoded=$framesDecoded '
+              'dropped=${values['framesDropped']} '
+              'keyFrames=${values['keyFramesDecoded']}\n'
+              '[stats] pkts=${values['packetsReceived']} '
               'bytes=${values['bytesReceived']} '
               'lost=${values['packetsLost']} '
               'jitter=${values['jitter']}\n'
-              '[stats] framesRecv=${values['framesReceived']} '
-              'decoded=${values['framesDecoded']} '
-              'dropped=${values['framesDropped']} '
-              'keyFrames=${values['keyFramesDecoded']}\n'
               '[stats] pli=${values['pliCount']} '
               'nack=${values['nackCount']} '
               'fir=${values['firCount']}';

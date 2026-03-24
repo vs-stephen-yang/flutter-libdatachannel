@@ -192,6 +192,7 @@ void SetupTrackCallbacks(int tr) {
 void OnTrack(int pc, int tr, void*) {
     std::string mid = GetRtcString(rtcGetTrackMid, tr);
     SetupTrackCallbacks(tr);
+    if (g_plugin) g_plugin->TrackRemoteTrack(tr);
 
     auto m = MakeEvent("onTrack");
     m[flutter::EncodableValue("pcId")] = flutter::EncodableValue(pc);
@@ -328,19 +329,63 @@ FlutterLibdatachannelPlugin::FlutterLibdatachannelPlugin(
 }
 
 FlutterLibdatachannelPlugin::~FlutterLibdatachannelPlugin() {
+  // Null out g_plugin first so worker-thread callbacks become no-ops.
+  g_plugin = nullptr;
+
+  // Stop recording/playback threads before closing peer connections.
+  ldc_dump::cleanup();
+
+  // Snapshot tracked IDs (track_ids_ may be modified from worker threads).
+  std::set<int> tracks, pcs;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    tracks = track_ids_;
+    pcs = pc_ids_;
+  }
+
+  // Unregister all callbacks on tracks so libdatachannel won't invoke them
+  // during destruction (which causes internal mutex deadlocks).
+  for (int tr : tracks) {
+    rtcSetOpenCallback(tr, nullptr);
+    rtcSetClosedCallback(tr, nullptr);
+    rtcSetErrorCallback(tr, nullptr);
+    rtcSetMessageCallback(tr, nullptr);
+  }
+
+  // Unregister all callbacks on PCs, then close and delete each one.
+  for (int pc : pcs) {
+    rtcSetLocalDescriptionCallback(pc, nullptr);
+    rtcSetLocalCandidateCallback(pc, nullptr);
+    rtcSetStateChangeCallback(pc, nullptr);
+    rtcSetIceStateChangeCallback(pc, nullptr);
+    rtcSetGatheringStateChangeCallback(pc, nullptr);
+    rtcSetSignalingStateChangeCallback(pc, nullptr);
+    rtcSetTrackCallback(pc, nullptr);
+    rtcClosePeerConnection(pc);
+  }
+  for (int tr : tracks) {
+    rtcDeleteTrack(tr);
+  }
+  for (int pc : pcs) {
+    rtcDeletePeerConnection(pc);
+  }
+
+  rtcCleanup();
+
   if (hwnd_) {
     DestroyWindow(hwnd_);
     hwnd_ = nullptr;
   }
-
-  ldc_dump::cleanup();
-  rtcCleanup();
-  g_plugin = nullptr;
 }
 
 // ---------------------------------------------------------------------------
 // Event queue (thread-safe enqueue from workers, drain on platform thread)
 // ---------------------------------------------------------------------------
+
+void FlutterLibdatachannelPlugin::TrackRemoteTrack(int tr) {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  track_ids_.insert(tr);
+}
 
 void FlutterLibdatachannelPlugin::EnqueueEvent(flutter::EncodableMap map) {
   {
@@ -430,6 +475,7 @@ void FlutterLibdatachannelPlugin::HandleMethodCall(
       return;
     }
 
+    pc_ids_.insert(pc);
     rtcSetLocalDescriptionCallback(pc, OnLocalDescription);
     rtcSetLocalCandidateCallback(pc, OnLocalCandidate);
     rtcSetStateChangeCallback(pc, OnStateChange);
@@ -445,7 +491,9 @@ void FlutterLibdatachannelPlugin::HandleMethodCall(
     result->Success();
 
   } else if (method == "deletePeerConnection") {
-    rtcDeletePeerConnection(GetIntArg(args, "pcId"));
+    int pc_id = GetIntArg(args, "pcId");
+    pc_ids_.erase(pc_id);
+    rtcDeletePeerConnection(pc_id);
     result->Success();
 
   } else if (method == "setLocalDescription") {
@@ -509,12 +557,15 @@ void FlutterLibdatachannelPlugin::HandleMethodCall(
     if (tr < 0) {
       result->Error("ADD_TRACK_FAILED", "Failed to add track");
     } else {
+      track_ids_.insert(tr);
       SetupTrackCallbacks(tr);
       result->Success(flutter::EncodableValue(tr));
     }
 
   } else if (method == "deleteTrack") {
-    rtcDeleteTrack(GetIntArg(args, "trId"));
+    int tr_id = GetIntArg(args, "trId");
+    track_ids_.erase(tr_id);
+    rtcDeleteTrack(tr_id);
     result->Success();
 
   } else if (method == "sendTrackMessage") {
@@ -579,7 +630,12 @@ void FlutterLibdatachannelPlugin::HandleMethodCall(
     int tr_id = GetIntArg(args, "trId");
     std::string file_path = GetStringArg(args, "filePath");
     int codec = GetIntArg(args, "codec", 0);
-    int ret = ldc_dump::start_recording(tr_id, file_path.c_str(), codec);
+    int ret = ldc_dump::start_recording(tr_id, file_path.c_str(), codec,
+        [](int id) {
+          auto m = MakeEvent("onRecordingError");
+          m[flutter::EncodableValue("trId")] = flutter::EncodableValue(id);
+          if (g_plugin) g_plugin->EnqueueEvent(std::move(m));
+        });
     if (ret < 0) {
       result->Error("START_RECORDING_FAILED", "Failed to start recording");
     } else {

@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <vector>
 
 namespace flutter_libdatachannel {
@@ -28,6 +29,9 @@ class FlutterLibdatachannelPlugin : public flutter::Plugin {
   // Called from libdatachannel worker threads to enqueue events for delivery
   // on the platform thread.
   void EnqueueEvent(flutter::EncodableMap map);
+
+  // Called from OnTrack callback to track remote track IDs for cleanup.
+  void TrackRemoteTrack(int tr);
 
  private:
   static constexpr UINT kDrainMessage = WM_APP + 0x4C44;
@@ -49,6 +53,9 @@ class FlutterLibdatachannelPlugin : public flutter::Plugin {
   std::queue<flutter::EncodableMap> event_queue_;
   std::mutex queue_mutex_;
   HWND hwnd_ = nullptr;  // hidden message-only window for thread marshalling
+
+  std::set<int> pc_ids_;    // track live PeerConnection IDs
+  std::set<int> track_ids_; // track live Track IDs
 };
 
 }  // namespace flutter_libdatachannel
