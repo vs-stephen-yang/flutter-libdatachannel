@@ -142,7 +142,7 @@ class ReceiveDumpPageState extends State<ReceiveDumpPage> {
       // Start recording
       final dir = await getApplicationDocumentsDirectory();
       final timestamp = DateTime.now().millisecondsSinceEpoch;
-      _dumpFilePath = '${dir.path}/dump_$timestamp.fldc';
+      _dumpFilePath = '${dir.path}/dump_$timestamp.rtpdump';
       await _recorder.start(_ldcTrack!, _dumpFilePath!);
       _log('Recording to: $_dumpFilePath');
 

@@ -5,7 +5,6 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:flutter_libdatachannel/flutter_libdatachannel.dart';
-import 'package:flutter_libdatachannel/src/dump_format.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -114,7 +113,7 @@ void main() {
     }
 
     // --- Set up BitstreamRecorder ---
-    final dumpPath = '${Directory.systemTemp.path}/ldc_test_dump.fldc';
+    final dumpPath = '${Directory.systemTemp.path}/ldc_test_dump.rtpdump';
     final recorder = BitstreamRecorder();
     await recorder.start(incomingTrack, dumpPath, codec: DumpCodec.h264);
     print('[recorder] started, writing to $dumpPath');
@@ -171,29 +170,28 @@ void main() {
 
     final dumpBytes = await dumpFile.readAsBytes();
     print('[verify] dump file size: ${dumpBytes.length} bytes');
-    expect(dumpBytes.length, greaterThanOrEqualTo(kDumpHeaderSize),
+    expect(dumpBytes.length, greaterThanOrEqualTo(kRtpDumpFileHeaderSize),
         reason: 'Dump file should have at least a header');
 
-    // Verify header
-    final header = DumpHeader.fromBytes(dumpBytes);
-    expect(header.codec, equals(DumpCodec.h264));
-    print('[verify] header valid: codec=${header.codec}');
+    // Verify the rtptools header parses.
+    final header = RtpDumpHeader.fromBytes(dumpBytes);
+    print('[verify] header valid: firstRecordAt=${header.headerEnd}');
 
     // Parse records
     final data = ByteData.sublistView(dumpBytes);
-    int offset = kDumpHeaderSize;
+    int offset = header.headerEnd;
     int recordCount = 0;
-    int prevTimestamp = 0;
+    int prevOffsetMs = 0;
     while (offset < dumpBytes.length) {
-      final record = DumpRecord.fromByteData(data, offset);
+      final record = RtpDumpPacket.fromByteData(data, offset);
       if (record == null) break;
-      expect(record.timestampUs, greaterThanOrEqualTo(prevTimestamp),
-          reason: 'Timestamps should be monotonically increasing');
+      expect(record.offsetMs, greaterThanOrEqualTo(prevOffsetMs),
+          reason: 'Offsets should be monotonically increasing');
       expect(record.payload.isNotEmpty, isTrue,
           reason: 'Record payload should not be empty');
-      print('[verify] record $recordCount: ts=${record.timestampUs}us, size=${record.payload.length}');
-      prevTimestamp = record.timestampUs;
-      offset += kDumpRecordHeaderSize + record.payload.length;
+      print('[verify] record $recordCount: offset=${record.offsetMs}ms, size=${record.payload.length}');
+      prevOffsetMs = record.offsetMs;
+      offset += record.sizeInFile;
       recordCount++;
     }
 

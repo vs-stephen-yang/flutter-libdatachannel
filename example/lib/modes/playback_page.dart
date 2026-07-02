@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart' as fwrtc;
@@ -71,7 +70,7 @@ class PlaybackPageState extends State<PlaybackPage> {
       final dir = await getApplicationDocumentsDirectory();
       final files = dir
           .listSync()
-          .where((f) => f.path.endsWith('.fldc'))
+          .where((f) => f.path.endsWith('.rtpdump'))
           .toList()
         ..sort((a, b) => b.path.compareTo(a.path));
       setState(() => _dumpFiles = files);
@@ -84,14 +83,14 @@ class PlaybackPageState extends State<PlaybackPage> {
     if (_selectedFile == null) return;
     setState(() => _status = 'connecting');
     try {
-      // Read dump header to determine codec
-      final raf = await File(_selectedFile!).open(mode: FileMode.read);
-      final headerBytes = Uint8List(16);
-      await raf.readInto(headerBytes);
-      await raf.close();
-      final header = ldc.DumpHeader.fromBytes(headerBytes);
-      final codec = _dumpCodecToRtcCodec(header.codec);
-      _log('File codec: ${header.codec.name}');
+      // The standard rtpdump format does not store a codec, so infer it from
+      // the RTP payload type of the recorded packets.
+      final bytes = await File(_selectedFile!).readAsBytes();
+      final dump = ldc.RtpDump.parse(bytes);
+      final pt = dump.primaryPayloadType;
+      final codec = ldc.codecForPayloadType(pt);
+      _log('Primary payload type: $pt → codec ${codec.name} '
+          '(${dump.packets.length} packets)');
 
       // Create peer connections (no STUN — local in-process connection)
       _ldcPc = await ldc.RTCPeerConnection.create(kLocalLdcConfig);
@@ -240,19 +239,6 @@ class PlaybackPageState extends State<PlaybackPage> {
       });
     }
     await _loadDumpFiles();
-  }
-
-  ldc.RTCCodec _dumpCodecToRtcCodec(ldc.DumpCodec dc) {
-    switch (dc) {
-      case ldc.DumpCodec.h264:
-        return ldc.RTCCodec.h264;
-      case ldc.DumpCodec.opus:
-        return ldc.RTCCodec.opus;
-      case ldc.DumpCodec.h265:
-        return ldc.RTCCodec.h265;
-      case ldc.DumpCodec.av1:
-        return ldc.RTCCodec.av1;
-    }
   }
 
   String _formatBytes(int bytes) {

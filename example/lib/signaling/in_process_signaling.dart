@@ -441,9 +441,6 @@ class InProcessSignaling {
 
       // Insert t= and BUNDLE after the last session-level line we inserted
       if (!hasT) {
-        final isInsertionPoint = (!hasS && line.startsWith('o=')) ||
-            (hasS ? line.startsWith('s=') : false) ||
-            (!hasO && !hasS && line.startsWith('v='));
         // Only add t= once, on the deepest insertion point
         if (line.startsWith('s=') ||
             (!hasS && line.startsWith('o=')) ||

@@ -45,13 +45,56 @@ static FILE* open_file(const char* path, const char* mode) {
 #endif
 
 // ---------------------------------------------------------------------------
-// Dump format constants (must match dump_format.dart)
+// Dump format — rtptools standard (.rtpdump), interoperable with Wireshark /
+// rtpplay / rtpdump. Layout:
+//   [text] "#!rtpplay1.0 <ip>/<port>\n"
+//   [16B]  RD_hdr_t:  start.tv_sec(u32) start.tv_usec(u32) source(u32)
+//                     port(u16) padding(u16)
+//   repeat RD_packet_t:
+//     [8B] length(u16) plen(u16) offset(u32, ms since start), then packet bytes
+// All multi-byte fields are network byte order (big-endian).
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t kDumpMagic   = 0x43444C46; // "FLDC" LE
-static constexpr uint32_t kDumpVersion = 1;
-static constexpr int kDumpHeaderSize       = 16;
-static constexpr int kDumpRecordHeaderSize = 12; // 8B timestamp + 4B length
+static constexpr int kRtpDumpFileHeaderSize   = 16; // RD_hdr_t
+static constexpr int kRtpDumpRecordHeaderSize = 8;  // RD_packet_t
+static constexpr int kMaxPreambleLen          = 256;
+
+// Preamble uses 0.0.0.0/0 — the address/port are informational only and not
+// used by our replay path.
+static const char kRtpDumpPreamble[] = "#!rtpplay1.0 0.0.0.0/0\n";
+
+// ---- big-endian helpers ----------------------------------------------------
+
+static void put_be16(uint8_t* p, uint16_t v) {
+    p[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    p[1] = static_cast<uint8_t>(v & 0xFF);
+}
+static void put_be32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+    p[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+    p[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    p[3] = static_cast<uint8_t>(v & 0xFF);
+}
+static uint16_t get_be16(const uint8_t* p) {
+    return static_cast<uint16_t>((p[0] << 8) | p[1]);
+}
+static uint32_t get_be32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+// Read the "#!rtpplay1.0 ...\n" preamble line (bounded). Leaves the file
+// positioned at the first RD_hdr_t byte. Returns false on malformed input.
+static bool read_preamble(FILE* f) {
+    for (int i = 0; i < kMaxPreambleLen; ++i) {
+        int c = fgetc(f);
+        if (c == EOF) return false;
+        if (c == '\n') return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Recording state
@@ -200,40 +243,41 @@ static void playback_thread_func(std::shared_ptr<PlaybackState> state,
         return;
     }
 
-    // Read and validate header
-    uint8_t hdr[kDumpHeaderSize];
-    if (fread(hdr, 1, kDumpHeaderSize, f) != kDumpHeaderSize) {
+    // Read the rtptools preamble + RD_hdr_t (16B, contents unused by replay).
+    uint8_t file_hdr[kRtpDumpFileHeaderSize];
+    if (!read_preamble(f) ||
+        fread(file_hdr, 1, kRtpDumpFileHeaderSize, f) != kRtpDumpFileHeaderSize) {
+        fprintf(stderr, "[LDC-DUMP] Invalid rtpdump header\n");
+        fflush(stderr);
         fclose(f);
         state->playing = false;
         if (state->on_complete) state->on_complete(tr_id);
         return;
     }
-    uint32_t magic;
-    memcpy(&magic, hdr, 4);
-    if (magic != kDumpMagic) {
-        fclose(f);
-        state->playing = false;
-        if (state->on_complete) state->on_complete(tr_id);
-        return;
-    }
+    // The preamble is variable-length, so remember where records begin.
+    long first_record_pos = ftell(f);
 
     // Pass 1: PT detection scan — find primary payload type
     std::unordered_map<int, int> pt_counts;
-    uint8_t rec_hdr[kDumpRecordHeaderSize];
+    uint8_t rec_hdr[kRtpDumpRecordHeaderSize];
     uint8_t pt_peek[2]; // enough to read PT byte from RTP header
     uint8_t scratch[4096];
 
-    while (fread(rec_hdr, 1, kDumpRecordHeaderSize, f) == kDumpRecordHeaderSize) {
-        uint32_t payload_len;
-        memcpy(&payload_len, rec_hdr + 8, 4);
+    while (fread(rec_hdr, 1, kRtpDumpRecordHeaderSize, f) == kRtpDumpRecordHeaderSize) {
+        // Bytes stored after this record header = length - 8.
+        uint16_t length = get_be16(rec_hdr);
+        uint32_t stored_len =
+            length >= kRtpDumpRecordHeaderSize
+                ? static_cast<uint32_t>(length - kRtpDumpRecordHeaderSize)
+                : 0;
 
-        if (payload_len >= 2) {
+        if (stored_len >= 2) {
             if (fread(pt_peek, 1, 2, f) != 2) break;
             int pt = pt_peek[1] & 0x7F;
             pt_counts[pt]++;
 
             // Read and discard remaining payload bytes
-            uint32_t remaining = payload_len - 2;
+            uint32_t remaining = stored_len - 2;
             while (remaining > 0) {
                 uint32_t chunk = remaining > sizeof(scratch)
                                      ? static_cast<uint32_t>(sizeof(scratch))
@@ -243,7 +287,7 @@ static void playback_thread_func(std::shared_ptr<PlaybackState> state,
             }
         } else {
             // Tiny payload, skip
-            uint32_t remaining = payload_len;
+            uint32_t remaining = stored_len;
             while (remaining > 0) {
                 uint32_t chunk = remaining > sizeof(scratch)
                                      ? static_cast<uint32_t>(sizeof(scratch))
@@ -267,7 +311,7 @@ done_scan:
     fflush(stderr);
 
     // Rewind to first record
-    fseek(f, kDumpHeaderSize, SEEK_SET);
+    fseek(f, first_record_pos, SEEK_SET);
 
     // Pass 2: streaming playback
     Depacketizer depack;
@@ -284,16 +328,23 @@ done_scan:
     bool wall_start_set = false;
 
     while (!state->stop_requested &&
-           fread(rec_hdr, 1, kDumpRecordHeaderSize, f) == kDumpRecordHeaderSize) {
+           fread(rec_hdr, 1, kRtpDumpRecordHeaderSize, f) == kRtpDumpRecordHeaderSize) {
 
-        uint64_t timestamp_us;
-        uint32_t payload_len;
-        memcpy(&timestamp_us, rec_hdr, 8);
-        memcpy(&payload_len, rec_hdr + 8, 4);
+        // RD_packet_t: length (incl. 8B header), plen, offset(ms). The stored
+        // packet bytes count is length - 8; offset is converted to us to reuse
+        // the timing logic below.
+        uint16_t length = get_be16(rec_hdr);
+        uint32_t offset_ms = get_be32(rec_hdr + 4);
+        uint32_t payload_len =
+            length >= kRtpDumpRecordHeaderSize
+                ? static_cast<uint32_t>(length - kRtpDumpRecordHeaderSize)
+                : 0;
+        uint64_t timestamp_us = static_cast<uint64_t>(offset_ms) * 1000ull;
 
         // Read payload
         pkt_buf.resize(payload_len);
-        if (fread(pkt_buf.data(), 1, payload_len, f) != payload_len) break;
+        if (payload_len > 0 &&
+            fread(pkt_buf.data(), 1, payload_len, f) != payload_len) break;
 
         total_records++;
         if (payload_len < 12) continue; // too small for RTP
@@ -412,20 +463,36 @@ int start_recording(int tr_id, const char* file_path, int codec,
                     ErrorCallback on_error) {
     auto state = std::make_shared<RecordingState>();
 
+    // The rtptools format infers codec from the RTP payload type, so the
+    // `codec` argument is retained for API compatibility but not written.
+    (void)codec;
+
     state->file = open_file(file_path, "wb");
     if (!state->file) return -1;
 
-    // Write header
-    uint8_t hdr[kDumpHeaderSize] = {};
-    uint32_t magic = kDumpMagic;
-    uint32_t version = kDumpVersion;
-    uint32_t codec_val = static_cast<uint32_t>(codec);
-    memcpy(hdr, &magic, 4);
-    memcpy(hdr + 4, &version, 4);
-    memcpy(hdr + 8, &codec_val, 4);
-    // hdr[12..15] = 0 (reserved)
+    // Write the text preamble.
+    if (fwrite(kRtpDumpPreamble, 1, sizeof(kRtpDumpPreamble) - 1, state->file) !=
+        sizeof(kRtpDumpPreamble) - 1) {
+        fclose(state->file);
+        return -1;
+    }
 
-    if (fwrite(hdr, 1, kDumpHeaderSize, state->file) != kDumpHeaderSize) {
+    // Write RD_hdr_t (16 bytes, big-endian). start = wall-clock time now;
+    // source/port are informational and left zero.
+    auto now_sys = std::chrono::system_clock::now();
+    auto since_epoch = now_sys.time_since_epoch();
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(since_epoch);
+    auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(
+                     since_epoch - secs);
+    uint8_t hdr[kRtpDumpFileHeaderSize] = {};
+    put_be32(hdr + 0, static_cast<uint32_t>(secs.count()));
+    put_be32(hdr + 4, static_cast<uint32_t>(usecs.count()));
+    put_be32(hdr + 8, 0); // source
+    put_be16(hdr + 12, 0); // port
+    put_be16(hdr + 14, 0); // padding
+
+    if (fwrite(hdr, 1, kRtpDumpFileHeaderSize, state->file) !=
+        kRtpDumpFileHeaderSize) {
         fclose(state->file);
         return -1;
     }
@@ -497,21 +564,25 @@ void on_rtp_packet(int tr_id, const uint8_t* data, int size) {
     if (!state->active) return;
 
     auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                       now - state->start_time)
-                       .count();
-    uint64_t timestamp_us = static_cast<uint64_t>(elapsed);
-    uint32_t length = static_cast<uint32_t>(size);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - state->start_time)
+                          .count();
+    // RD_packet_t: length = bytes stored incl. this 8B header; plen = packet
+    // length (RTP header+payload); offset = ms since recording start.
+    uint16_t plen = static_cast<uint16_t>(size);
+    uint16_t length = static_cast<uint16_t>(size + kRtpDumpRecordHeaderSize);
+    uint32_t offset_ms = static_cast<uint32_t>(elapsed_ms);
 
-    uint8_t rec_hdr[kDumpRecordHeaderSize];
-    memcpy(rec_hdr, &timestamp_us, 8);
-    memcpy(rec_hdr + 8, &length, 4);
+    uint8_t rec_hdr[kRtpDumpRecordHeaderSize];
+    put_be16(rec_hdr + 0, length);
+    put_be16(rec_hdr + 2, plen);
+    put_be32(rec_hdr + 4, offset_ms);
 
     ErrorCallback error_cb;
     {
         std::lock_guard<std::mutex> sl(state->mutex);
         if (!state->active || !state->file) return;
-        if (fwrite(rec_hdr, 1, kDumpRecordHeaderSize, state->file) != kDumpRecordHeaderSize ||
+        if (fwrite(rec_hdr, 1, kRtpDumpRecordHeaderSize, state->file) != kRtpDumpRecordHeaderSize ||
             fwrite(data, 1, size, state->file) != static_cast<size_t>(size)) {
             state->active = false;
             error_cb = state->on_error;

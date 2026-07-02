@@ -5,7 +5,6 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:flutter_libdatachannel/flutter_libdatachannel.dart';
-import 'package:flutter_libdatachannel/src/dump_format.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -13,14 +12,13 @@ void main() {
   testWidgets('Playback test: write dump file, play it back via ldc sender -> ldc receiver',
       (WidgetTester tester) async {
     // --- Create a synthetic dump file ---
-    final dumpPath = '${Directory.systemTemp.path}/ldc_playback_test.fldc';
+    final dumpPath = '${Directory.systemTemp.path}/ldc_playback_test.rtpdump';
     final payloads = <Uint8List>[];
 
     {
       final file = await File(dumpPath).open(mode: FileMode.write);
-      // Write header
-      final header = DumpHeader(codec: DumpCodec.h264);
-      await file.writeFrom(header.toBytes());
+      // Write the rtptools preamble + RD_hdr_t.
+      await file.writeFrom(RtpDumpHeader().toBytes());
 
       // Write 5 records at 100ms intervals with valid H264 length-prefix frames
       for (int i = 0; i < 5; i++) {
@@ -40,8 +38,8 @@ void main() {
         }
         payloads.add(Uint8List.fromList(payload));
 
-        final record = DumpRecord(
-          timestampUs: i * 100000, // 100ms apart
+        final record = RtpDumpPacket(
+          offsetMs: i * 100, // 100ms apart
           payload: payload,
         );
         await file.writeFrom(record.toBytes());
@@ -54,10 +52,11 @@ void main() {
 
     // Verify the dump file we just created
     final dumpBytes = await File(dumpPath).readAsBytes();
-    expect(dumpBytes.length, greaterThan(kDumpHeaderSize));
-    final parsedHeader = DumpHeader.fromBytes(dumpBytes);
-    expect(parsedHeader.codec, equals(DumpCodec.h264));
-    print('[setup] dump file verified: ${dumpBytes.length} bytes');
+    expect(dumpBytes.length, greaterThan(kRtpDumpFileHeaderSize));
+    final parsed = RtpDump.parse(dumpBytes);
+    expect(parsed.packets.length, equals(payloads.length));
+    print('[setup] dump file verified: ${dumpBytes.length} bytes, '
+        '${parsed.packets.length} packets');
 
     // --- Setup two peer connections ---
     final sender = await RTCPeerConnection.create(

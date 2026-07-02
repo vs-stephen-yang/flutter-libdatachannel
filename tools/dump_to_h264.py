@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Extract H.264 NALUs from a .fldc dump file (which contains raw RTP packets).
+"""Extract H.264 NALUs from a standard rtptools .rtpdump file.
 
-Usage: python dump_to_h264.py <input.fldc> [output.h264]
+Usage: python dump_to_h264.py <input.rtpdump> [output.h264]
 
-The output is a raw Annex B H.264 bitstream that ffmpeg/ffprobe can read.
+The input is a standard rtptools dump (text preamble + 16B RD_hdr_t + 8B
+RD_packet_t records), interoperable with Wireshark / rtpplay. The output is a
+raw Annex B H.264 bitstream that ffmpeg/ffprobe can read.
 """
 import struct
 import sys
 
-HEADER_SIZE = 16
-RECORD_HEADER_SIZE = 12  # 8B timestamp + 4B length
+FILE_HEADER_SIZE = 16    # RD_hdr_t
+RECORD_HEADER_SIZE = 8   # RD_packet_t: length(u16) plen(u16) offset(u32), big-endian
 
 def strip_rtp_header(pkt):
     """Strip RTP header (fixed + CSRC + extension + padding) → payload."""
@@ -48,23 +50,27 @@ def main():
     outfile = sys.argv[2] if len(sys.argv) > 2 else infile.rsplit('.', 1)[0] + '.h264'
 
     with open(infile, 'rb') as f:
-        hdr = f.read(HEADER_SIZE)
-        magic = struct.unpack_from('<I', hdr, 0)[0]
-        version = struct.unpack_from('<I', hdr, 4)[0]
-        codec = struct.unpack_from('<I', hdr, 8)[0]
-        print(f'Magic: 0x{magic:08x}  Version: {version}  Codec: {codec} (0=H264)')
+        # Text preamble line: "#!rtpplay1.0 <ip>/<port>\n"
+        preamble = f.readline()
+        if not preamble.startswith(b'#!rtpplay'):
+            print(f'Warning: unexpected preamble: {preamble!r}')
+        # RD_hdr_t (16 bytes, big-endian) — informational only.
+        hdr = f.read(FILE_HEADER_SIZE)
+        if len(hdr) >= FILE_HEADER_SIZE:
+            start_sec, start_usec, source, port, _pad = struct.unpack('>IIIHH', hdr)
+            print(f'Start: {start_sec}.{start_usec:06d}  source: {source}  port: {port}')
 
         packets = []
         while True:
             rec_hdr = f.read(RECORD_HEADER_SIZE)
             if len(rec_hdr) < RECORD_HEADER_SIZE:
                 break
-            ts_us = struct.unpack_from('<Q', rec_hdr, 0)[0]
-            plen = struct.unpack_from('<I', rec_hdr, 8)[0]
-            payload = f.read(plen)
-            if len(payload) < plen:
+            length, plen, offset_ms = struct.unpack('>HHI', rec_hdr)
+            stored_len = length - RECORD_HEADER_SIZE if length >= RECORD_HEADER_SIZE else 0
+            payload = f.read(stored_len)
+            if len(payload) < stored_len:
                 break
-            packets.append((ts_us, payload))
+            packets.append((offset_ms, payload))
 
     print(f'Read {len(packets)} RTP packets')
 
