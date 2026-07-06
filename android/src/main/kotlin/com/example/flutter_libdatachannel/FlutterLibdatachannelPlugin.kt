@@ -1,5 +1,7 @@
 package com.example.flutter_libdatachannel
 
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
@@ -14,6 +16,10 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
     private lateinit var channel: MethodChannel
     private lateinit var eventChannel: EventChannel
     private var eventSink: EventChannel.EventSink? = null
+
+    // Native callbacks arrive on libdatachannel worker threads, but Flutter
+    // channel APIs must be invoked on the main (platform) thread.
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         init {
@@ -51,7 +57,7 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
     @Suppress("unused")
     fun onEvent(eventJson: String) {
         val map = jsonToMap(eventJson)
-        eventSink?.success(map)
+        mainHandler.post { eventSink?.success(map) }
     }
 
     // Called from JNI when binary track data arrives
@@ -61,7 +67,7 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
         map["event"] = "onTrackMessage"
         map["trId"] = trId
         map["data"] = data
-        eventSink?.success(map)
+        mainHandler.post { eventSink?.success(map) }
     }
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
