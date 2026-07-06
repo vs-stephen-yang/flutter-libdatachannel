@@ -85,9 +85,9 @@ Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeSetEv
 
 JNIEXPORT jint JNICALL
 Java_com_example_flutter_1libdatachannel_FlutterLibdatachannelPlugin_nativeCreatePeerConnection(
-    JNIEnv* env, jobject thiz, jstring ice_servers_json) {
+    JNIEnv* env, jobject thiz, jstring ice_servers_json, jint disable_auto_negotiation) {
     const char* json = ice_servers_json ? env->GetStringUTFChars(ice_servers_json, nullptr) : nullptr;
-    int result = ldc_create_peer_connection(json);
+    int result = ldc_create_peer_connection(json, (int)disable_auto_negotiation);
     if (json) env->ReleaseStringUTFChars(ice_servers_json, json);
     return result;
 }

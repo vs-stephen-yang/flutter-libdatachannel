@@ -23,7 +23,7 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
 
     // JNI methods
     private external fun nativeSetEventHandler(handler: Any?)
-    private external fun nativeCreatePeerConnection(iceServersJson: String?): Int
+    private external fun nativeCreatePeerConnection(iceServersJson: String?, disableAutoNegotiation: Int): Int
     private external fun nativeClosePeerConnection(pcId: Int)
     private external fun nativeDeletePeerConnection(pcId: Int)
     private external fun nativeSetLocalDescription(pcId: Int, type: String?): Int
@@ -85,8 +85,13 @@ class FlutterLibdatachannelPlugin : FlutterPlugin, MethodCallHandler, EventChann
     override fun onMethodCall(call: MethodCall, result: Result) {
         when (call.method) {
             "createPeerConnection" -> {
-                val iceServers = call.argument<String>("iceServers")
-                val pcId = nativeCreatePeerConnection(iceServers)
+                // Dart sends iceServers as a List<String>; serialize to the JSON
+                // array string the native layer expects. disableAutoNegotiation
+                // arrives as an int (1/0).
+                val iceServersList = call.argument<List<String>>("iceServers") ?: emptyList()
+                val iceServersJson = org.json.JSONArray(iceServersList).toString()
+                val disableAutoNeg = call.argument<Int>("disableAutoNegotiation") ?: 0
+                val pcId = nativeCreatePeerConnection(iceServersJson, disableAutoNeg)
                 if (pcId < 0) result.error("CREATE_FAILED", "Failed to create peer connection", null)
                 else result.success(pcId)
             }

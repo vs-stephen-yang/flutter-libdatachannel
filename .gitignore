@@ -34,3 +34,5 @@ build/
 
 # FVM Version Cache
 .fvm/
+# Cross-compiled MbedTLS for Android (regenerate via tools/build_mbedtls_android.sh)
+android/third_party/mbedtls-android/
