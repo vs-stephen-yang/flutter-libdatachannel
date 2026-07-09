@@ -44,6 +44,17 @@ LDC_EXPORT int ldc_set_opus_packetizer(int tr_id, const char* init_json);
 LDC_EXPORT int ldc_chain_rtcp_receiving_session(int tr_id);
 LDC_EXPORT int ldc_chain_rtcp_sr_reporter(int tr_id);
 
+// Recording (RTP bitstream dump). Thin C wrappers over ldc_dump:: so the
+// method-channel / FFI bindings can record without calling C++ directly
+// (Android uses ldc_dump:: via JNI). Packet capture itself is already wired on
+// the track-message path (ldc_dump::on_rtp_packet), so only start/stop needed.
+LDC_EXPORT int ldc_start_recording(int tr_id, const char* file_path, int codec);
+LDC_EXPORT int ldc_stop_recording(int tr_id);
+
+// Selected ICE candidate pair as "local || remote" (caller frees with ldc_free);
+// empty string if none selected yet. Diagnostic for connectivity issues.
+LDC_EXPORT char* ldc_get_selected_candidate_pair(int pc_id);
+
 // Callback for events sent to platform layer
 typedef void (*ldc_event_callback)(const char* event_json, void* user_data);
 typedef void (*ldc_binary_event_callback)(int tr_id, const uint8_t* data, int size, void* user_data);

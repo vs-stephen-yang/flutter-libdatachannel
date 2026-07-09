@@ -133,6 +133,14 @@ class RTCPeerConnection {
     });
   }
 
+  /// The selected ICE candidate pair as "local || remote", or null if none is
+  /// selected yet. Diagnostic for connectivity issues.
+  Future<String?> getSelectedCandidatePair() async {
+    final s = await _channel.invoke<String>(
+        'getSelectedCandidatePair', {'pcId': _pcId});
+    return (s == null || s.isEmpty) ? null : s;
+  }
+
   Future<RTCTrack> addTrack(RTCTrackInit init) async {
     final trId = await _channel.invoke<int>('addTrack', {
       'pcId': _pcId,

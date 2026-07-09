@@ -36,3 +36,5 @@ build/
 .fvm/
 # Cross-compiled MbedTLS for Android (regenerate via tools/build_mbedtls_android.sh)
 android/third_party/mbedtls-android/
+# Cross-compiled MbedTLS for iOS (regenerate via tools/build_mbedtls_ios.sh)
+ios/third_party/mbedtls-ios/

@@ -491,3 +491,20 @@ int ldc_chain_rtcp_receiving_session(int tr_id) {
 int ldc_chain_rtcp_sr_reporter(int tr_id) {
     return rtcChainRtcpSrReporter(tr_id);
 }
+
+int ldc_start_recording(int tr_id, const char* file_path, int codec) {
+    return ldc_dump::start_recording(tr_id, file_path, codec, nullptr);
+}
+
+int ldc_stop_recording(int tr_id) {
+    return ldc_dump::stop_recording(tr_id);
+}
+
+char* ldc_get_selected_candidate_pair(int pc_id) {
+    char local[512] = {0};
+    char remote[512] = {0};
+    int ret = rtcGetSelectedCandidatePair(pc_id, local, (int)sizeof(local),
+                                          remote, (int)sizeof(remote));
+    if (ret < 0) return strdup_export(std::string());
+    return strdup_export(std::string(local) + " || " + std::string(remote));
+}
