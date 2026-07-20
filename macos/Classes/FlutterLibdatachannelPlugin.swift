@@ -69,7 +69,7 @@ public class FlutterLibdatachannelPlugin: NSObject, FlutterPlugin, FlutterStream
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let args = call.arguments as? [String: Any] else {
             if call.method == "createPeerConnection" {
-                let pcId = ldc_create_peer_connection(nil)
+                let pcId = ldc_create_peer_connection(nil, 0)
                 result(Int(pcId))
                 return
             }
@@ -80,7 +80,8 @@ public class FlutterLibdatachannelPlugin: NSObject, FlutterPlugin, FlutterStream
         switch call.method {
         case "createPeerConnection":
             let iceServers = args["iceServers"] as? String
-            let pcId = ldc_create_peer_connection(iceServers)
+            let disableAutoNeg = args["disableAutoNegotiation"] as? Int ?? 0
+            let pcId = ldc_create_peer_connection(iceServers, Int32(disableAutoNeg))
             if pcId < 0 {
                 result(FlutterError(code: "CREATE_FAILED", message: "Failed to create peer connection", details: nil))
             } else {
@@ -212,6 +213,36 @@ public class FlutterLibdatachannelPlugin: NSObject, FlutterPlugin, FlutterStream
             let ret = ldc_chain_rtcp_sr_reporter(Int32(args["trId"] as! Int))
             if ret < 0 {
                 result(FlutterError(code: "CHAIN_FAILED", message: "Failed", details: nil))
+            } else {
+                result(nil)
+            }
+
+        case "startRecording":
+            let trId = Int32(args["trId"] as! Int)
+            let filePath = args["filePath"] as? String
+            let codec = Int32(args["codec"] as? Int ?? 0)
+            let ret = ldc_start_recording(trId, filePath, codec)
+            if ret < 0 {
+                result(FlutterError(code: "START_RECORDING_FAILED", message: "Failed", details: nil))
+            } else {
+                result(nil)
+            }
+
+        case "stopRecording":
+            let trId = Int32(args["trId"] as! Int)
+            let ret = ldc_stop_recording(trId)
+            if ret < 0 {
+                result(FlutterError(code: "STOP_RECORDING_FAILED", message: "Failed", details: nil))
+            } else {
+                result(nil)
+            }
+
+        case "getSelectedCandidatePair":
+            let pcId = Int32(args["pcId"] as! Int)
+            if let cstr = ldc_get_selected_candidate_pair(pcId) {
+                let s = String(cString: cstr)
+                ldc_free(cstr)
+                result(s)
             } else {
                 result(nil)
             }

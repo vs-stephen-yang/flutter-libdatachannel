@@ -38,3 +38,5 @@ build/
 android/third_party/mbedtls-android/
 # Cross-compiled MbedTLS for iOS (regenerate via tools/build_mbedtls_ios.sh)
 ios/third_party/mbedtls-ios/
+# Cross-compiled MbedTLS for macOS (regenerate via tools/build_mbedtls_macos.sh)
+macos/third_party/mbedtls-macos/
