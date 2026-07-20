@@ -16,11 +16,27 @@ cmake_policy(VERSION 3.14...3.25)
 # not be changed
 set(PLUGIN_NAME "flutter_libdatachannel_plugin")
 
+# TLS backend: Windows ships no system OpenSSL (libdatachannel's default), so use
+# MbedTLS like the other platforms. This also flips libSRTP to its MbedTLS crypto
+# engine (libdatachannel sets ENABLE_MBEDTLS when USE_MBEDTLS). find_package(MbedTLS
+# 3) (called from libdatachannel during add_subdirectory below) locates the static
+# prebuilt produced by tools/build_mbedtls_windows.ps1 via CMAKE_PREFIX_PATH. That
+# build MUST have MBEDTLS_SSL_DTLS_SRTP enabled or DTLS-SRTP key extraction fails.
+set(MBEDTLS_WINDOWS_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls-windows")
+if(NOT EXISTS "${MBEDTLS_WINDOWS_PREFIX}/include/mbedtls/build_info.h")
+  message(FATAL_ERROR
+    "MbedTLS for Windows not found at ${MBEDTLS_WINDOWS_PREFIX}.\n"
+    "Build it first:  pwsh tools/build_mbedtls_windows.ps1")
+endif()
+list(PREPEND CMAKE_PREFIX_PATH "${MBEDTLS_WINDOWS_PREFIX}")
+set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
+
 # Build libdatachannel from source
 set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
 set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
 set(RTC_STATIC ON CACHE BOOL "" FORCE)
+set(LIBSRTP_TEST_APPS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libdatachannel"
                  "${CMAKE_CURRENT_BINARY_DIR}/libdatachannel" EXCLUDE_FROM_ALL)
 
@@ -64,6 +80,10 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin)
 target_link_libraries(${PLUGIN_NAME} PRIVATE datachannel-static)
 
 # List of absolute paths to libraries that should be bundled with the plugin.
+# Everything is linked statically into flutter_libdatachannel_plugin.dll:
+# datachannel-static pulls in libjuice/libsrtp/usrsctp (all static via RTC_STATIC)
+# and MbedTLS::MbedTLS (the static prebuilt), so there are no extra runtime DLLs
+# to copy alongside the app.
 set(flutter_libdatachannel_bundled_libraries
   ""
   PARENT_SCOPE
